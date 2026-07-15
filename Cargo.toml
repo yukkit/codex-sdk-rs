@@ -1,0 +1,71 @@
+[package]
+name = "codex-sdk-rs"
+edition.workspace = true
+readme.workspace = true
+repository.workspace = true
+license.workspace = true
+rust-version.workspace = true
+version.workspace = true
+publish = false
+
+[lib]
+name = "codex_sdk"
+
+[workspace]
+resolver = "2"
+members = [".", "example"]
+
+[workspace.package]
+edition = "2024"
+readme = "README.md"
+repository = "https://github.com/yukkit/<repo>"
+license = "Apache-2.0"
+rust-version = "1.85.0"
+version = "0.1.0"
+
+[workspace.dependencies]
+# internal dependencies
+# third-party dependencies
+anyhow = "1"
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+thiserror = "2"
+tokio = { version = "1", features = ["macros", "rt-multi-thread", "sync", "time"] }
+tokio-stream = { version = "0.1", features = ["sync"] }
+tracing = "0.1"
+tracing-subscriber = { version = "0.3", features = ["env-filter", "fmt"] }
+dotenvy = "0.15"
+
+[dependencies]
+anyhow.workspace = true
+serde.workspace = true
+serde_json.workspace = true
+thiserror.workspace = true
+tokio.workspace = true
+tokio-stream.workspace = true
+tracing.workspace = true
+tracing-subscriber.workspace = true
+dotenvy.workspace = true
+
+codex-app-server-client = { git = "https://github.com/openai/codex", tag = "rust-v0.144.4", package = "codex-app-server-client" }
+codex-app-server-protocol = { git = "https://github.com/openai/codex", tag = "rust-v0.144.4", package = "codex-app-server-protocol" }
+codex-arg0 = { git = "https://github.com/openai/codex", tag = "rust-v0.144.4", package = "codex-arg0" }
+codex-config = { git = "https://github.com/openai/codex", tag = "rust-v0.144.4", package = "codex-config" }
+codex-core = { git = "https://github.com/openai/codex", tag = "rust-v0.144.4", package = "codex-core" }
+codex-feedback = { git = "https://github.com/openai/codex", tag = "rust-v0.144.4", package = "codex-feedback" }
+codex-otel = { git = "https://github.com/openai/codex", tag = "rust-v0.144.4", package = "codex-otel" }
+codex-protocol = { git = "https://github.com/openai/codex", tag = "rust-v0.144.4", package = "codex-protocol" }
+codex-utils-absolute-path = { git = "https://github.com/openai/codex", tag = "rust-v0.144.4", package = "codex-utils-absolute-path" }
+
+# The current Codex dependency graph needs these prerelease crates pinned so
+# Cargo does not resolve versions that require a newer rustc.
+rama-error = "=0.3.0-alpha.4"
+rama-macros = "=0.3.0-alpha.4"
+rama-utils = "=0.3.0-alpha.4"
+
+[patch.crates-io]
+tokio-tungstenite = { git = "https://github.com/openai-oss-forks/tokio-tungstenite", rev = "0e5b2d73aa18dd9f0a50ee9ff199d5aef7594186" }
+tungstenite = { git = "https://github.com/openai-oss-forks/tungstenite-rs", rev = "4fffad30fe373adbdcffab9545e9e9bf4f2fc19f" }
+
+[patch."ssh://git@github.com/openai-oss-forks/tungstenite-rs.git"]
+tungstenite = { git = "https://github.com/openai-oss-forks/tungstenite-rs", rev = "4fffad30fe373adbdcffab9545e9e9bf4f2fc19f" }
