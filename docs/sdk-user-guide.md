@@ -451,18 +451,18 @@ let mut stream = thread
 
 while let Some(event) = stream.next().await {
     match event {
-        TurnEvent::ServerNotification(
+        AppServerEvent::ServerNotification(
             ServerNotification::AgentMessageDelta(delta),
         ) => {
             print!("{}", delta.delta);
         }
-        TurnEvent::ServerNotification(
+        AppServerEvent::ServerNotification(
             ServerNotification::TurnCompleted(done),
         ) => {
             eprintln!("turn completed: {:?}", done.turn.status);
             break;
         }
-        TurnEvent::ServerRequest(request) => {
+        AppServerEvent::ServerRequest(request) => {
             // Show this to the user, then resolve or reject it.
             stream
                 .reject_server_request(request.id().clone(), "not approved")
@@ -486,7 +486,7 @@ let mut stream = turn.stream();
 while let Some(event) = stream.next().await {
     if matches!(
         event,
-        TurnEvent::ServerNotification(ServerNotification::TurnCompleted(_))
+        AppServerEvent::ServerNotification(ServerNotification::TurnCompleted(_))
     ) {
         break;
     }
@@ -502,11 +502,11 @@ Common events:
   `AgentMessageDelta`, `TurnCompleted`, `Error`, token usage, and so on.
 - `ServerRequest`: requests that the application needs to answer.
 - `Lagged`: the event buffer skipped messages.
-- `RuntimeClosed`: the runtime is closed.
+- `Disconnected`: the runtime connection closed.
 
-`TurnEvent` is only the SDK stream envelope. The actual protocol payloads are
-native Codex `ServerNotification` / `ServerRequest` values, so Codex protocol
-field and variant changes are exposed at compile time as much as possible.
+`AppServerEvent` is the native Codex app-server client event type. Its protocol
+payloads are native `ServerNotification` / `ServerRequest` values, so Codex
+protocol field and variant changes are exposed directly at compile time.
 
 Note: the underlying event distribution currently uses a broadcast channel.
 `Lagged` means this consumer has missed some events; interactive UIs should mark
@@ -523,7 +523,7 @@ answer, the turn may wait.
 
 ```rust,no_run
 match event {
-    TurnEvent::ServerRequest(request) => {
+    AppServerEvent::ServerRequest(request) => {
         println!("request id = {}", request.id());
         println!("request = {:?}", request);
 
@@ -800,7 +800,7 @@ Recommended structure:
 - Create one shared `Codex` when the process starts.
 - Create one `Thread` for each browser/business session.
 - Create one `TurnStream` for each user input.
-- Convert `TurnEvent` values into SSE/WebSocket events.
+- Convert `AppServerEvent` values into SSE/WebSocket events.
 - When a `ServerRequest` arrives, send the request id and native request content
   to the frontend. After the frontend approves or rejects it, send the request
   id back to the backend, then call `Codex::resolve_server_request()` or

@@ -489,13 +489,13 @@ app-server event ownership pitfalls.
 
 ## Event Dispatch Boundary
 
-SDK `TurnEvent` is this crate's stream envelope, but payloads remain native
-Codex values:
+Turn streams expose the native `codex_app_server_client::AppServerEvent`
+directly:
 
-- `TurnEvent::ServerNotification(codex_app_server_protocol::ServerNotification)`
-- `TurnEvent::ServerRequest(codex_app_server_protocol::ServerRequest)`
-- `TurnEvent::Lagged`
-- `TurnEvent::RuntimeClosed`
+- `AppServerEvent::ServerNotification(codex_app_server_protocol::ServerNotification)`
+- `AppServerEvent::ServerRequest(codex_app_server_protocol::ServerRequest)`
+- `AppServerEvent::Lagged`
+- `AppServerEvent::Disconnected`
 
 Event filtering rules should prefer typed protocol fields such as `thread_id`,
 `turn_id`, `thread.id`, and `turn.id`, instead of guessing from JSON `Value`

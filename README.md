@@ -10,10 +10,9 @@ backends:
 - **Remote app-server**: connect to an already-running Codex app-server over
   WebSocket or Unix socket.
 
-The SDK keeps app-server protocol payloads as native Codex types where protocol
-compatibility matters. For example, `TurnEvent` carries
-`codex_app_server_protocol::ServerNotification` and
-`codex_app_server_protocol::ServerRequest` directly.
+The SDK exposes Codex's native `codex_app_server_client::AppServerEvent` for
+turn streams, including native server notifications, requests, lag, and
+disconnection events.
 
 ## Status
 

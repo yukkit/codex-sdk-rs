@@ -561,7 +561,7 @@ impl CodexBuilder {
     /// Set the capacity of the internal broadcast and command channels.
     ///
     /// Small values reduce buffering, while larger values tolerate slower event
-    /// consumers before [`TurnEvent::Lagged`](crate::TurnEvent::Lagged)
+    /// consumers before [`AppServerEvent::Lagged`](crate::AppServerEvent::Lagged)
     /// appears.
     pub fn channel_capacity(mut self, capacity: usize) -> Self {
         self.runtime.channel_capacity = capacity.max(1);
@@ -642,7 +642,7 @@ impl CodexWithConfigBuilder {
     /// Set the capacity of the internal broadcast and command channels.
     ///
     /// Small values reduce buffering, while larger values tolerate slower event
-    /// consumers before [`TurnEvent::Lagged`](crate::TurnEvent::Lagged)
+    /// consumers before [`AppServerEvent::Lagged`](crate::AppServerEvent::Lagged)
     /// appears.
     pub fn channel_capacity(mut self, capacity: usize) -> Self {
         self.runtime.channel_capacity = capacity.max(1);

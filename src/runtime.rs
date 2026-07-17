@@ -20,7 +20,6 @@ use tokio::task::JoinHandle;
 use tracing::warn;
 
 use crate::error::{Error, Result};
-use crate::event::TurnEvent;
 use crate::types::ClientInfo;
 
 pub(crate) struct RuntimeHandle {
@@ -31,7 +30,7 @@ pub(crate) struct RuntimeHandle {
     /// Monotonic JSON-RPC request id source.
     request_ids: AtomicI64,
     /// Broadcast channel for filtered turn streams and SDK consumers.
-    event_tx: broadcast::Sender<TurnEvent>,
+    event_tx: broadcast::Sender<AppServerEvent>,
     /// Shutdown signal for the background app-server event loop.
     shutdown_tx: Mutex<Option<oneshot::Sender<()>>>,
     /// Join handle for the background app-server event loop.
@@ -147,7 +146,7 @@ impl RuntimeHandle {
             .map_err(Error::protocol)
     }
 
-    pub fn subscribe(&self) -> broadcast::Receiver<TurnEvent> {
+    pub fn subscribe(&self) -> broadcast::Receiver<AppServerEvent> {
         self.event_tx.subscribe()
     }
 
@@ -266,31 +265,24 @@ fn spawn_event_loop(
                 }
                 event = client.next_event() => {
                     let Some(event) = event else {
-                        let _ = runtime.event_tx.send(TurnEvent::RuntimeClosed);
+                        let _ = runtime.event_tx.send(AppServerEvent::Disconnected {
+                            message: "Codex app-server event stream closed".to_string(),
+                        });
                         break;
                     };
-                    let runtime_event = match event {
-                        AppServerEvent::Lagged { skipped } => {
-                            TurnEvent::Lagged {
-                                skipped: skipped as u64,
-                            }
-                        }
-                        AppServerEvent::ServerRequest(request) => {
-                            TurnEvent::ServerRequest(request)
-                        }
-                        AppServerEvent::ServerNotification(notification) => {
-                            TurnEvent::ServerNotification(notification)
-                        }
-                        AppServerEvent::Disconnected { message } => {
-                            warn!(%message, "Codex app-server disconnected");
-                            let _ = runtime.event_tx.send(TurnEvent::RuntimeClosed);
-                            break;
-                        }
-                    };
-                    let _ = runtime.event_tx.send(runtime_event);
+                    if let AppServerEvent::Disconnected { message } = &event {
+                        warn!(%message, "Codex app-server disconnected");
+                    }
+                    let disconnected = matches!(event, AppServerEvent::Disconnected { .. });
+                    let _ = runtime.event_tx.send(event);
+                    if disconnected {
+                        break;
+                    }
                 }
                 _ = &mut shutdown_rx => {
-                    let _ = runtime.event_tx.send(TurnEvent::RuntimeClosed);
+                    let _ = runtime.event_tx.send(AppServerEvent::Disconnected {
+                        message: "Codex app-server runtime shut down".to_string(),
+                    });
                     break;
                 }
             }

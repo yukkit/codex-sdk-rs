@@ -87,16 +87,15 @@ For every new or changed `ServerRequest`, decide:
 
 Verify these SDK boundary assumptions still hold:
 
-- `TurnEvent` should stay close to Codex-native protocol:
-  `ServerNotification`, `ServerRequest`, `Lagged`, `RuntimeClosed`.
-- `TurnEvent::ServerRequest` should expose the native `ServerRequest`
+- Turn streams should expose the native `AppServerEvent` directly.
+- `AppServerEvent::ServerRequest` should expose the native `ServerRequest`
   directly. Runtime behavior such as resolve/reject belongs on `Codex` or
   `TurnStream`.
 - `TurnBuilder::stream()` must subscribe before `turn/start` to avoid missing
   fast events.
 - `TurnBuilder::send()` / `TurnStream::collect()` should fail closed for
   unhandled `ServerRequest`s.
-- Explicit `Codex::shutdown()` should notify streams with `RuntimeClosed` and
+- Explicit `Codex::shutdown()` should notify streams with `Disconnected` and
   wait for the runtime task to exit.
 - One active turn per `Thread` should remain enforced unless the routing model is
   redesigned.

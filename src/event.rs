@@ -1,40 +1,19 @@
+use codex_app_server_client::AppServerEvent;
 use codex_app_server_protocol::{ServerNotification, ServerRequest};
 
-/// Event emitted by a [`TurnStream`](crate::TurnStream).
-///
-/// This is an SDK stream envelope, not a Codex protocol enum. Codex protocol
-/// messages are surfaced as native [`ServerRequest`] and [`ServerNotification`]
-/// values; the SDK adds only transport health and runtime lifecycle markers.
-#[derive(Debug, Clone)]
-pub enum TurnEvent {
-    /// A native Codex app-server request that the application must answer.
-    ///
-    /// Use [`Codex::resolve_server_request`](crate::Codex::resolve_server_request)
-    /// or [`TurnStream::resolve_server_request`](crate::TurnStream::resolve_server_request)
-    /// with [`ServerRequest::id`] when the user or host application responds.
-    ServerRequest(ServerRequest),
-    /// A native Codex app-server notification.
-    ServerNotification(ServerNotification),
-    /// The event receiver fell behind and skipped buffered events.
-    Lagged {
-        /// Number of events skipped before the stream receiver caught up.
-        skipped: u64,
-    },
-    /// The Codex app-server runtime connection closed.
-    RuntimeClosed,
-}
-
 pub(crate) fn event_matches(
-    event: &TurnEvent,
+    event: &AppServerEvent,
     thread_id: &str,
     turn_id: Option<&str>,
 ) -> bool {
     match event {
-        TurnEvent::ServerRequest(request) => request_matches(request, thread_id, turn_id),
-        TurnEvent::ServerNotification(notification) => {
+        AppServerEvent::ServerRequest(request) => {
+            request_matches(request, thread_id, turn_id)
+        }
+        AppServerEvent::ServerNotification(notification) => {
             notification_matches(notification, thread_id, turn_id)
         }
-        TurnEvent::Lagged { .. } | TurnEvent::RuntimeClosed => true,
+        AppServerEvent::Lagged { .. } | AppServerEvent::Disconnected { .. } => true,
     }
 }
 

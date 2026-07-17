@@ -2,6 +2,7 @@ use std::future::{Future, IntoFuture};
 use std::pin::Pin;
 use std::time::Duration;
 
+use codex_app_server_client::AppServerEvent;
 use codex_app_server_protocol::{
     AskForApproval, ClientRequest, RequestId, SandboxMode, SandboxPolicy,
     ServerNotification, ThreadStartParams, TurnInterruptParams, TurnInterruptResponse,
@@ -13,7 +14,7 @@ use tokio::sync::{OwnedSemaphorePermit, broadcast};
 
 use crate::client::Codex;
 use crate::error::{Error, Result};
-use crate::event::{TurnEvent, event_matches};
+use crate::event::event_matches;
 use crate::runtime::RuntimeHandle;
 use crate::thread::Thread;
 use crate::types::{ThreadId, TurnId, cwd_to_string};
@@ -74,7 +75,7 @@ pub struct TurnResult {
     /// Concatenated assistant message deltas.
     final_response: String,
     /// Events observed before completion.
-    events: Vec<TurnEvent>,
+    events: Vec<AppServerEvent>,
 }
 
 impl TurnResult {
@@ -111,7 +112,7 @@ impl TurnResult {
     }
 
     /// Events observed while collecting the turn.
-    pub fn events(&self) -> &[TurnEvent] {
+    pub fn events(&self) -> &[AppServerEvent] {
         &self.events
     }
 }
@@ -309,7 +310,7 @@ pub struct TurnHandle {
     /// Active turn id.
     turn_id: TurnId,
     /// Receiver subscribed before `turn/start`, so early events are not missed.
-    rx: broadcast::Receiver<TurnEvent>,
+    rx: broadcast::Receiver<AppServerEvent>,
 }
 
 impl TurnHandle {
@@ -631,7 +632,7 @@ pub struct TurnStream {
     /// Turn id used to filter broadcast runtime events.
     turn_id: TurnId,
     /// Subscription to the shared runtime event broadcast channel.
-    rx: broadcast::Receiver<TurnEvent>,
+    rx: broadcast::Receiver<AppServerEvent>,
 }
 
 impl TurnStream {
@@ -694,15 +695,17 @@ impl TurnStream {
     }
 
     /// Wait for the next event matching this turn.
-    pub async fn next(&mut self) -> Option<TurnEvent> {
+    pub async fn next(&mut self) -> Option<AppServerEvent> {
         loop {
             let event = match self.rx.recv().await {
                 Ok(event) => event,
                 Err(broadcast::error::RecvError::Lagged(skipped)) => {
-                    return Some(TurnEvent::Lagged { skipped });
+                    return Some(AppServerEvent::Lagged {
+                        skipped: skipped.try_into().unwrap_or(usize::MAX),
+                    });
                 }
                 Err(broadcast::error::RecvError::Closed) => {
-                    return Some(TurnEvent::RuntimeClosed);
+                    return None;
                 }
             };
 
@@ -723,12 +726,12 @@ impl TurnStream {
 
         while let Some(event) = self.next().await {
             match &event {
-                TurnEvent::ServerNotification(ServerNotification::AgentMessageDelta(
-                    delta,
-                )) => {
+                AppServerEvent::ServerNotification(
+                    ServerNotification::AgentMessageDelta(delta),
+                ) => {
                     final_response.push_str(&delta.delta);
                 }
-                TurnEvent::ServerRequest(request) => {
+                AppServerEvent::ServerRequest(request) => {
                     let request_id = request.id().clone();
                     self.reject_server_request(
                         request_id,
@@ -736,7 +739,7 @@ impl TurnStream {
                     )
                     .await?;
                 }
-                TurnEvent::ServerNotification(ServerNotification::Error(error))
+                AppServerEvent::ServerNotification(ServerNotification::Error(error))
                     if !error.will_retry =>
                 {
                     return Err(Error::TurnFailed {
@@ -745,7 +748,9 @@ impl TurnStream {
                         message: error.error.message.clone(),
                     });
                 }
-                TurnEvent::ServerNotification(ServerNotification::TurnCompleted(_)) => {
+                AppServerEvent::ServerNotification(
+                    ServerNotification::TurnCompleted(_),
+                ) => {
                     events.push(event);
                     return Ok(TurnResult {
                         thread_id: self.thread_id.clone(),
@@ -754,7 +759,7 @@ impl TurnStream {
                         events,
                     });
                 }
-                TurnEvent::RuntimeClosed => return Err(Error::RuntimeClosed),
+                AppServerEvent::Disconnected { .. } => return Err(Error::RuntimeClosed),
                 _ => {}
             }
             events.push(event);
