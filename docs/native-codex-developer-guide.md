@@ -505,10 +505,10 @@ explicitly whether it is turn-scoped, thread-scoped, or global.
 
 Dispatch from the runtime to `TurnStream` currently uses a Tokio broadcast
 channel. Slow consumers receive `Lagged { skipped }`; this means the stream may
-have missed deltas, requests, or `TurnCompleted`. Synchronous
-`TurnStream::collect()` still relies on receiving `TurnCompleted`, which is a
-reliability boundary that needs a dedicated design later and should not be
-refactored casually during a normal protocol upgrade.
+have missed deltas, requests, or `TurnCompleted`. Synchronous `send()`
+aggregation still relies on receiving `TurnCompleted`, which is a reliability
+boundary that needs a dedicated design later and should not be refactored
+casually during a normal protocol upgrade.
 
 ## Dependency Audit Boundary
 

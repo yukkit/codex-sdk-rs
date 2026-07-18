@@ -95,6 +95,7 @@ Example path dependency inside this repository:
 codex-sdk-rs = { path = "../codex-sdk-rs" }
 anyhow = "1"
 tokio = { version = "1", features = ["macros", "rt-multi-thread"] }
+tokio-stream = "0.1"
 ```
 
 The crate name is `codex-sdk-rs`, and the Rust import name is `codex_sdk`.
@@ -443,13 +444,15 @@ host system or to a preconfigured `codex_home`.
 Interactive UIs should use streaming:
 
 ```rust,no_run
+use tokio_stream::StreamExt;
+
 let mut stream = thread
     .turn("Run the pg MCP smoke test.")
     .approval_policy(AskForApproval::OnRequest)
     .stream()
     .await?;
 
-while let Some(event) = stream.next().await {
+while let Some(event) = StreamExt::next(&mut stream).await {
     match event {
         AppServerEvent::ServerNotification(
             ServerNotification::AgentMessageDelta(delta),
@@ -479,11 +482,13 @@ If you need to steer or interrupt a turn before or while consuming the stream,
 start it as a `TurnHandle`:
 
 ```rust,no_run
+use tokio_stream::StreamExt;
+
 let turn = thread.turn("Count from 1 to 100.").start().await?;
 turn.steer("Stop after 10 numbers.").await?;
 
 let mut stream = turn.stream();
-while let Some(event) = stream.next().await {
+while let Some(event) = StreamExt::next(&mut stream).await {
     if matches!(
         event,
         AppServerEvent::ServerNotification(ServerNotification::TurnCompleted(_))

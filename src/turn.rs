@@ -1,5 +1,6 @@
 use std::future::{Future, IntoFuture};
 use std::pin::Pin;
+use std::task::{Context, Poll, ready};
 use std::time::Duration;
 
 use codex_app_server_client::AppServerEvent;
@@ -11,6 +12,9 @@ use codex_app_server_protocol::{
 use codex_protocol::config_types::{Personality, ReasoningSummary};
 use codex_protocol::openai_models::ReasoningEffort;
 use tokio::sync::{OwnedSemaphorePermit, broadcast};
+use tokio_stream::Stream;
+use tokio_stream::wrappers::BroadcastStream;
+use tokio_stream::wrappers::errors::BroadcastStreamRecvError;
 
 use crate::client::Codex;
 use crate::error::{Error, Result};
@@ -337,18 +341,19 @@ impl TurnHandle {
     /// Consume this handle and return a filtered event stream.
     pub fn stream(self) -> TurnStream {
         TurnStream {
-            _permit: self._permit,
+            permit: Some(self._permit),
             runtime: self.runtime,
             thread_id: self.thread_id,
             turn_id: self.turn_id,
-            rx: self.rx,
+            rx: BroadcastStream::new(self.rx),
+            terminated: false,
         }
     }
 
     /// Consume the event stream until the turn completes.
     pub async fn send(self) -> Result<TurnResult> {
         let mut stream = self.stream();
-        stream.collect().await
+        stream.collect_result().await
     }
 
     /// Consume the event stream until the turn completes.
@@ -619,12 +624,12 @@ async fn interrupt_turn(
 
 /// Stream of events for one active turn.
 ///
-/// Dropping the stream releases the thread's active-turn permit. Keep polling
-/// it until `ServerNotification::TurnCompleted` when you need the turn to
-/// finish normally.
+/// The stream yields its matching `ServerNotification::TurnCompleted` or a
+/// runtime disconnection once and then ends. Dropping it earlier releases the
+/// thread's active-turn permit.
 pub struct TurnStream {
     /// Permit that keeps this thread from starting another active turn.
-    _permit: OwnedSemaphorePermit,
+    permit: Option<OwnedSemaphorePermit>,
     /// Runtime used to resolve server requests and keep Codex alive.
     runtime: std::sync::Arc<RuntimeHandle>,
     /// Thread id used to filter broadcast runtime events.
@@ -632,7 +637,9 @@ pub struct TurnStream {
     /// Turn id used to filter broadcast runtime events.
     turn_id: TurnId,
     /// Subscription to the shared runtime event broadcast channel.
-    rx: broadcast::Receiver<AppServerEvent>,
+    rx: BroadcastStream<AppServerEvent>,
+    /// Set after a terminal event has been yielded or the source closes.
+    terminated: bool,
 }
 
 impl TurnStream {
@@ -694,37 +701,11 @@ impl TurnStream {
             .await
     }
 
-    /// Wait for the next event matching this turn.
-    pub async fn next(&mut self) -> Option<AppServerEvent> {
-        loop {
-            let event = match self.rx.recv().await {
-                Ok(event) => event,
-                Err(broadcast::error::RecvError::Lagged(skipped)) => {
-                    return Some(AppServerEvent::Lagged {
-                        skipped: skipped.try_into().unwrap_or(usize::MAX),
-                    });
-                }
-                Err(broadcast::error::RecvError::Closed) => {
-                    return None;
-                }
-            };
-
-            if event_matches(&event, &self.thread_id, Some(&self.turn_id)) {
-                return Some(event);
-            }
-        }
-    }
-
-    /// Collect this stream until the turn completes.
-    ///
-    /// This is the implementation behind [`TurnBuilder::send`]. It appends
-    /// `ServerNotification::AgentMessageDelta` payloads into the final response
-    /// and returns when `ServerNotification::TurnCompleted` arrives.
-    pub async fn collect(&mut self) -> Result<TurnResult> {
+    async fn collect_result(&mut self) -> Result<TurnResult> {
         let mut final_response = String::new();
         let mut events = Vec::new();
 
-        while let Some(event) = self.next().await {
+        while let Some(event) = tokio_stream::StreamExt::next(&mut *self).await {
             match &event {
                 AppServerEvent::ServerNotification(
                     ServerNotification::AgentMessageDelta(delta),
@@ -767,10 +748,64 @@ impl TurnStream {
 
         Err(Error::RuntimeClosed)
     }
+
+    fn poll_next_event(&mut self, cx: &mut Context<'_>) -> Poll<Option<AppServerEvent>> {
+        if self.terminated {
+            return Poll::Ready(None);
+        }
+
+        loop {
+            let event = match ready!(Pin::new(&mut self.rx).poll_next(cx)) {
+                Some(Ok(event)) => event,
+                Some(Err(BroadcastStreamRecvError::Lagged(skipped))) => {
+                    return Poll::Ready(Some(AppServerEvent::Lagged {
+                        skipped: skipped.try_into().unwrap_or(usize::MAX),
+                    }));
+                }
+                None => {
+                    self.terminate();
+                    return Poll::Ready(None);
+                }
+            };
+
+            if event_matches(&event, &self.thread_id, Some(&self.turn_id)) {
+                if is_terminal_turn_event(&event) {
+                    self.terminate();
+                }
+                return Poll::Ready(Some(event));
+            }
+        }
+    }
+
+    fn terminate(&mut self) {
+        self.terminated = true;
+        // A terminal event should not keep the thread locked because the
+        // caller retains the stream after inspecting its terminal event.
+        self.permit.take();
+    }
+}
+
+impl Stream for TurnStream {
+    type Item = AppServerEvent;
+
+    fn poll_next(self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<Option<Self::Item>> {
+        self.get_mut().poll_next_event(cx)
+    }
+}
+
+fn is_terminal_turn_event(event: &AppServerEvent) -> bool {
+    matches!(
+        event,
+        AppServerEvent::ServerNotification(ServerNotification::TurnCompleted(_))
+            | AppServerEvent::Disconnected { .. }
+    )
 }
 
 #[cfg(test)]
 mod tests {
+    use codex_app_server_protocol::{
+        Turn, TurnCompletedNotification, TurnItemsView, TurnStatus,
+    };
     use serde::Deserialize;
 
     use super::*;
@@ -799,6 +834,41 @@ mod tests {
                 score: 7,
             }
         );
+    }
+
+    #[test]
+    fn turn_stream_implements_stream() {
+        fn assert_stream<T: Stream<Item = AppServerEvent>>() {}
+
+        assert_stream::<TurnStream>();
+    }
+
+    #[test]
+    fn turn_stream_terminal_events_are_explicit() {
+        let completed = AppServerEvent::ServerNotification(
+            ServerNotification::TurnCompleted(TurnCompletedNotification {
+                thread_id: "thread-1".to_string(),
+                turn: Turn {
+                    id: "turn-1".to_string(),
+                    items: Vec::new(),
+                    items_view: TurnItemsView::Full,
+                    status: TurnStatus::Completed,
+                    error: None,
+                    started_at: Some(1),
+                    completed_at: Some(2),
+                    duration_ms: Some(1_000),
+                },
+            }),
+        );
+        let disconnected = AppServerEvent::Disconnected {
+            message: "runtime closed".to_string(),
+        };
+
+        assert!(is_terminal_turn_event(&completed));
+        assert!(is_terminal_turn_event(&disconnected));
+        assert!(!is_terminal_turn_event(&AppServerEvent::Lagged {
+            skipped: 1,
+        }));
     }
 
     #[test]

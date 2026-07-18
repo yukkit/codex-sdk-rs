@@ -64,7 +64,7 @@ For every new or changed `ServerNotification`, decide:
 - Does it belong to a specific `thread_id`?
 - Does it belong to a specific `turn_id`?
 - Is it global and should active turn streams see it?
-- Does `TurnStream::collect()` need to react to it?
+- Does the batch `send()` aggregation path need to react to it?
 
 For `ThreadStartParams` and `TurnStartParams`, decide:
 
@@ -93,8 +93,7 @@ Verify these SDK boundary assumptions still hold:
   `TurnStream`.
 - `TurnBuilder::stream()` must subscribe before `turn/start` to avoid missing
   fast events.
-- `TurnBuilder::send()` / `TurnStream::collect()` should fail closed for
-  unhandled `ServerRequest`s.
+- The batch `send()` path should fail closed for unhandled `ServerRequest`s.
 - Explicit `Codex::shutdown()` should notify streams with `Disconnected` and
   wait for the runtime task to exit.
 - One active turn per `Thread` should remain enforced unless the routing model is
