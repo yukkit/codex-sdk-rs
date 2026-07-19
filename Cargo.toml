@@ -13,7 +13,7 @@ name = "codex_sdk"
 
 [workspace]
 resolver = "2"
-members = [".", "example"]
+members = ["."]
 
 [workspace.package]
 edition = "2024"

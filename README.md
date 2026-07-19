@@ -209,6 +209,9 @@ owns the global `tracing_subscriber`.
 
 ## Documentation
 
+- [Runnable Cargo examples](examples/README.md): one-off review, interactive
+  repair, thread lifecycle, concurrent batch work, runtime operations, remote
+  clients, and the native request escape hatch.
 - [SDK user guide](docs/sdk-user-guide.md): for application developers using
   `codex-sdk-rs`.
 - [API parity notes](docs/api-parity.md): comparison with the official

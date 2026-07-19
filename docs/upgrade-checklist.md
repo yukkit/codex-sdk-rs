@@ -141,7 +141,7 @@ cargo test
 If example behavior changed, also run or compile the example:
 
 ```sh
-cargo check -p example
+cargo check --examples
 ```
 
 ## 7. Update Docs

@@ -67,10 +67,16 @@ clippy: setup-clippy
 	cargo clippy --workspace --all-targets --fix --allow-staged
 
 build:
-	cargo build --workspace --bins
+	cargo build --workspace
 
 build_release:
-	cargo build --release --workspace --bins
+	cargo build --release --workspace
+
+build_examples:
+	cargo build --workspace --examples
+
+build_examples_release:
+	cargo build --release --workspace --examples
 
 doc-test:
 	cargo test --no-fail-fast --doc --all-features --workspace
@@ -89,4 +95,4 @@ clean:
 run:
 	cargo run -- run
 
-.PHONY: setup setup-cargo-deny setup-nightly setup-cargo-udeps setup-clippy docs check fmt fmt_check clippy clippy_check build build_release test docs_check clean run
+.PHONY: setup setup-cargo-deny setup-nightly setup-cargo-udeps setup-clippy docs check fmt fmt_check clippy clippy_check build build_release build_examples build_examples_release test docs_check clean run
