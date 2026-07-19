@@ -1,27 +1,16 @@
-use std::future::{Future, IntoFuture};
-use std::pin::Pin;
-use std::task::{Context, Poll, ready};
-use std::time::Duration;
-
-use codex_app_server_client::AppServerEvent;
 use codex_app_server_protocol::{
-    AskForApproval, ClientRequest, RequestId, SandboxMode, SandboxPolicy,
-    ServerNotification, ThreadStartParams, TurnInterruptParams, TurnInterruptResponse,
-    TurnStartParams, TurnStartResponse, TurnSteerParams, TurnSteerResponse, UserInput,
+    AskForApproval, ClientRequest, SandboxMode, SandboxPolicy, ThreadStartParams,
+    TurnInterruptParams, TurnInterruptResponse, TurnStartParams, TurnStartResponse,
+    TurnSteerParams, TurnSteerResponse, UserInput,
 };
 use codex_protocol::config_types::{Personality, ReasoningSummary};
 use codex_protocol::openai_models::ReasoningEffort;
-use tokio::sync::{OwnedSemaphorePermit, broadcast};
-use tokio_stream::Stream;
-use tokio_stream::wrappers::BroadcastStream;
-use tokio_stream::wrappers::errors::BroadcastStreamRecvError;
 
 use crate::client::Codex;
-use crate::error::{Error, Result};
-use crate::event::event_matches;
+use crate::error::Result;
 use crate::runtime::RuntimeHandle;
 use crate::thread::Thread;
-use crate::types::{ThreadId, TurnId, cwd_to_string};
+use crate::types::{TurnId, cwd_to_string};
 
 /// Converts common SDK input shapes into native Codex turn input items.
 pub trait IntoTurnInput {
@@ -65,75 +54,16 @@ impl<const N: usize> IntoTurnInput for [UserInput; N] {
     }
 }
 
-/// Result collected from a completed turn.
-///
-/// This is returned by `send()` helpers, which consume the event stream until
-/// `ServerNotification::TurnCompleted` and concatenate assistant message
-/// deltas into [`final_response`](Self::final_response).
-#[derive(Debug, Clone)]
-pub struct TurnResult {
-    /// Thread id associated with the completed turn.
-    thread_id: ThreadId,
-    /// Turn id associated with the completed turn.
-    turn_id: TurnId,
-    /// Concatenated assistant message deltas.
-    final_response: String,
-    /// Events observed before completion.
-    events: Vec<AppServerEvent>,
-}
-
-impl TurnResult {
-    /// Thread id associated with the completed turn.
-    pub fn thread_id(&self) -> &str {
-        &self.thread_id
-    }
-
-    /// Turn id associated with the completed turn.
-    pub fn turn_id(&self) -> &str {
-        &self.turn_id
-    }
-
-    /// Concatenated final assistant response text.
-    pub fn final_response(&self) -> &str {
-        &self.final_response
-    }
-
-    /// Parse the final assistant response as JSON.
-    pub fn final_response_json(&self) -> Result<serde_json::Value> {
-        Ok(serde_json::from_str(&self.final_response)?)
-    }
-
-    /// Deserialize the final assistant response as a typed JSON value.
-    ///
-    /// Pair this with native [`TurnStartParams`] or a builder
-    /// `output_schema` method when you want Codex to produce a
-    /// schema-constrained result.
-    pub fn final_response_as<T>(&self) -> Result<T>
-    where
-        T: serde::de::DeserializeOwned,
-    {
-        Ok(serde_json::from_str(&self.final_response)?)
-    }
-
-    /// Events observed while collecting the turn.
-    pub fn events(&self) -> &[AppServerEvent] {
-        &self.events
-    }
-}
-
 /// Builder for [`Codex::turn`](crate::Codex::turn).
 ///
-/// This convenience path creates a temporary thread, starts one turn, and
-/// collects the final response.
+/// This convenience path creates a temporary thread and starts one turn.
 pub struct CodexTurnBuilder {
     /// Runtime used for the ephemeral thread.
-    pub(crate) codex: Codex,
+    codex: Codex,
     /// Native Codex params used when creating the temporary thread.
-    pub(crate) thread_params: ThreadStartParams,
+    thread_params: ThreadStartParams,
     /// Native Codex params used when starting the turn.
-    pub(crate) turn_params: TurnStartParams,
-    /// Maximum wall-clock time to wait when collecting this turn.
-    pub(crate) timeout: Option<Duration>,
+    turn_params: TurnStartParams,
 }
 
 impl CodexTurnBuilder {
@@ -142,19 +72,18 @@ impl CodexTurnBuilder {
     }
 
     pub(crate) fn from_params(codex: Codex, turn_params: TurnStartParams) -> Self {
-        let thread_params = codex.inner.default_thread_params.clone();
+        let thread_params = codex.default_thread_params().clone();
         Self {
             codex,
             thread_params,
             turn_params,
-            timeout: None,
         }
     }
 
     /// Set the working directory for both the temporary thread and turn.
     pub fn cwd(mut self, cwd: impl Into<std::path::PathBuf>) -> Self {
         let cwd = cwd.into();
-        self.thread_params.cwd = Some(cwd_to_string(cwd.clone()));
+        self.thread_params.cwd = Some(cwd_to_string(&cwd));
         self.turn_params.cwd = Some(cwd);
         self
     }
@@ -288,39 +217,40 @@ impl CodexTurnBuilder {
         self
     }
 
-    /// Set the timeout used while collecting this turn.
-    pub fn timeout(mut self, timeout: Duration) -> Self {
-        self.timeout = Some(timeout);
-        self
-    }
-
-    /// Create the temporary thread, start the turn, and collect the result.
-    pub async fn send(self) -> Result<TurnResult> {
-        self.start_ephemeral_thread().await
+    /// Create the temporary thread, start the turn, and return its handle.
+    pub async fn start(self) -> Result<TurnHandle> {
+        let thread = self
+            .codex
+            .thread()
+            .params(self.thread_params)
+            .start()
+            .await?;
+        TurnBuilder::from_params(thread, self.turn_params)
+            .start()
+            .await
     }
 }
 
 /// Handle for a started Codex turn.
 ///
-/// Use this when the application needs to steer or interrupt an active turn
-/// before consuming its event stream.
+/// Use this when the application needs to identify, steer, or interrupt an
+/// active turn. Events are consumed from the owning [`Thread`].
 pub struct TurnHandle {
-    /// Permit that keeps this thread from starting another active turn.
-    _permit: OwnedSemaphorePermit,
-    /// Runtime used for control requests and event subscription.
-    runtime: std::sync::Arc<RuntimeHandle>,
-    /// Thread id associated with the active turn.
-    thread_id: ThreadId,
+    /// Thread that owns this turn and its long-lived event stream.
+    thread: Thread,
     /// Active turn id.
     turn_id: TurnId,
-    /// Receiver subscribed before `turn/start`, so early events are not missed.
-    rx: broadcast::Receiver<AppServerEvent>,
 }
 
 impl TurnHandle {
+    /// Thread that owns this turn.
+    pub fn thread(&self) -> &Thread {
+        &self.thread
+    }
+
     /// Thread id this handle controls.
     pub fn thread_id(&self) -> &str {
-        &self.thread_id
+        self.thread.id()
     }
 
     /// Turn id this handle controls.
@@ -330,35 +260,23 @@ impl TurnHandle {
 
     /// Send additional input to this active turn.
     pub async fn steer(&self, input: impl IntoTurnInput) -> Result<TurnSteerResponse> {
-        steer_turn(&self.runtime, &self.thread_id, &self.turn_id, input).await
+        steer_turn(
+            self.thread.codex().runtime(),
+            self.thread.id(),
+            &self.turn_id,
+            input,
+        )
+        .await
     }
 
     /// Request interruption of this active turn.
     pub async fn interrupt(&self) -> Result<TurnInterruptResponse> {
-        interrupt_turn(&self.runtime, &self.thread_id, &self.turn_id).await
-    }
-
-    /// Consume this handle and return a filtered event stream.
-    pub fn stream(self) -> TurnStream {
-        TurnStream {
-            permit: Some(self._permit),
-            runtime: self.runtime,
-            thread_id: self.thread_id,
-            turn_id: self.turn_id,
-            rx: BroadcastStream::new(self.rx),
-            terminated: false,
-        }
-    }
-
-    /// Consume the event stream until the turn completes.
-    pub async fn send(self) -> Result<TurnResult> {
-        let mut stream = self.stream();
-        stream.collect_result().await
-    }
-
-    /// Consume the event stream until the turn completes.
-    pub async fn run(self) -> Result<TurnResult> {
-        self.send().await
+        interrupt_turn(
+            self.thread.codex().runtime(),
+            self.thread.id(),
+            &self.turn_id,
+        )
+        .await
     }
 }
 
@@ -368,8 +286,6 @@ pub struct TurnBuilder {
     thread: Thread,
     /// Native Codex params sent with `turn/start`.
     params: TurnStartParams,
-    /// Maximum wall-clock time to wait when collecting this turn.
-    timeout: Option<Duration>,
 }
 
 impl TurnBuilder {
@@ -378,11 +294,7 @@ impl TurnBuilder {
     }
 
     pub(crate) fn from_params(thread: Thread, params: TurnStartParams) -> Self {
-        Self {
-            thread,
-            params,
-            timeout: None,
-        }
+        Self { thread, params }
     }
 
     /// Replace the native Codex `turn/start` params for this builder, including input.
@@ -485,76 +397,30 @@ impl TurnBuilder {
         self
     }
 
-    /// Set the timeout used by [`send`](Self::send).
-    pub fn timeout(mut self, timeout: Duration) -> Self {
-        self.timeout = Some(timeout);
-        self
-    }
-
-    pub(crate) fn maybe_timeout(mut self, timeout: Option<Duration>) -> Self {
-        self.timeout = timeout;
-        self
-    }
-
-    /// Start the turn and return a handle for streaming or control.
+    /// Start the turn and return its control handle.
+    ///
+    /// Consume events from [`Thread::event_stream`], which spans every turn in
+    /// this thread.
     pub async fn start(self) -> Result<TurnHandle> {
-        let permit = self.thread.acquire_turn_permit().await?;
-        let runtime = self.thread.codex().inner.runtime.clone();
-        let rx = runtime.subscribe();
+        let thread_id = self.thread.id().to_string();
         let mut params = self.params;
-        params.thread_id = self.thread.id().to_string();
-        let response: TurnStartResponse = runtime
+        params.thread_id = thread_id.clone();
+        let response: TurnStartResponse = self
+            .thread
+            .codex()
             .request_typed(ClientRequest::TurnStart {
-                request_id: runtime.next_request_id(),
+                request_id: self.thread.codex().next_request_id(),
                 params,
             })
             .await?;
 
-        let thread_id = self.thread.id().to_string();
         let turn_id = response.turn.id;
         tracing::info!(%thread_id, %turn_id, "started Codex turn");
 
         Ok(TurnHandle {
-            _permit: permit,
-            runtime,
-            thread_id,
+            thread: self.thread,
             turn_id,
-            rx,
         })
-    }
-
-    /// Start the turn and return a filtered event stream.
-    ///
-    /// The returned stream only yields events matching this thread and turn,
-    /// plus runtime-level events such as lag and shutdown.
-    pub async fn stream(self) -> Result<TurnStream> {
-        Ok(self.start().await?.stream())
-    }
-
-    /// Start the turn and collect it until completion.
-    ///
-    /// Server requests are rejected automatically because this method has no UI
-    /// hook for approvals. Use [`stream`](Self::stream) when the application
-    /// needs to handle approvals or elicitation.
-    pub async fn send(self) -> Result<TurnResult> {
-        let timeout = self.timeout;
-        let run = async move { self.start().await?.send().await };
-
-        match timeout {
-            Some(timeout) => tokio::time::timeout(timeout, run)
-                .await
-                .map_err(|_| Error::Timeout { timeout })?,
-            None => run.await,
-        }
-    }
-}
-
-impl IntoFuture for TurnBuilder {
-    type Output = Result<TurnResult>;
-    type IntoFuture = Pin<Box<dyn Future<Output = Self::Output> + Send>>;
-
-    fn into_future(self) -> Self::IntoFuture {
-        Box::pin(async move { self.send().await })
     }
 }
 
@@ -622,254 +488,9 @@ async fn interrupt_turn(
         .await
 }
 
-/// Stream of events for one active turn.
-///
-/// The stream yields its matching `ServerNotification::TurnCompleted` or a
-/// runtime disconnection once and then ends. Dropping it earlier releases the
-/// thread's active-turn permit.
-pub struct TurnStream {
-    /// Permit that keeps this thread from starting another active turn.
-    permit: Option<OwnedSemaphorePermit>,
-    /// Runtime used to resolve server requests and keep Codex alive.
-    runtime: std::sync::Arc<RuntimeHandle>,
-    /// Thread id used to filter broadcast runtime events.
-    thread_id: ThreadId,
-    /// Turn id used to filter broadcast runtime events.
-    turn_id: TurnId,
-    /// Subscription to the shared runtime event broadcast channel.
-    rx: BroadcastStream<AppServerEvent>,
-    /// Set after a terminal event has been yielded or the source closes.
-    terminated: bool,
-}
-
-impl TurnStream {
-    /// Thread id this stream is filtered to.
-    pub fn thread_id(&self) -> &str {
-        &self.thread_id
-    }
-
-    /// Turn id this stream is filtered to.
-    pub fn turn_id(&self) -> &str {
-        &self.turn_id
-    }
-
-    /// Send additional input to this active turn.
-    pub async fn steer(&self, input: impl IntoTurnInput) -> Result<TurnSteerResponse> {
-        steer_turn(&self.runtime, &self.thread_id, &self.turn_id, input).await
-    }
-
-    /// Request interruption of this active turn.
-    pub async fn interrupt(&self) -> Result<TurnInterruptResponse> {
-        interrupt_turn(&self.runtime, &self.thread_id, &self.turn_id).await
-    }
-
-    /// Resolve a Codex server request with a method-specific result payload.
-    ///
-    /// `request_id` should come from [`ServerRequest::id`](crate::ServerRequest::id).
-    /// The expected `result` shape depends on the concrete
-    /// [`ServerRequest`](crate::ServerRequest) variant. This method is a
-    /// stream-scoped convenience for applications that answer requests while
-    /// consuming turn events.
-    pub async fn resolve_server_request(
-        &self,
-        request_id: RequestId,
-        result: impl serde::Serialize,
-    ) -> Result<()> {
-        let result = serde_json::to_value(result)?;
-        self.runtime
-            .resolve_server_request(request_id, result)
-            .await
-    }
-
-    /// Resolve a Codex server request with an empty JSON object.
-    ///
-    /// This is a convenience for approval flows whose successful response
-    /// payload is `{}`.
-    pub async fn approve_server_request(&self, request_id: RequestId) -> Result<()> {
-        self.resolve_server_request(request_id, serde_json::json!({}))
-            .await
-    }
-
-    /// Reject a Codex server request with a human-readable message.
-    pub async fn reject_server_request(
-        &self,
-        request_id: RequestId,
-        message: impl Into<String>,
-    ) -> Result<()> {
-        self.runtime
-            .reject_server_request(request_id, message)
-            .await
-    }
-
-    async fn collect_result(&mut self) -> Result<TurnResult> {
-        let mut final_response = String::new();
-        let mut events = Vec::new();
-
-        while let Some(event) = tokio_stream::StreamExt::next(&mut *self).await {
-            match &event {
-                AppServerEvent::ServerNotification(
-                    ServerNotification::AgentMessageDelta(delta),
-                ) => {
-                    final_response.push_str(&delta.delta);
-                }
-                AppServerEvent::ServerRequest(request) => {
-                    let request_id = request.id().clone();
-                    self.reject_server_request(
-                        request_id,
-                        "codex-sdk-rs TurnBuilder::send does not handle approvals",
-                    )
-                    .await?;
-                }
-                AppServerEvent::ServerNotification(ServerNotification::Error(error))
-                    if !error.will_retry =>
-                {
-                    return Err(Error::TurnFailed {
-                        thread_id: error.thread_id.clone(),
-                        turn_id: Some(error.turn_id.clone()),
-                        message: error.error.message.clone(),
-                    });
-                }
-                AppServerEvent::ServerNotification(
-                    ServerNotification::TurnCompleted(_),
-                ) => {
-                    events.push(event);
-                    return Ok(TurnResult {
-                        thread_id: self.thread_id.clone(),
-                        turn_id: self.turn_id.clone(),
-                        final_response,
-                        events,
-                    });
-                }
-                AppServerEvent::Disconnected { .. } => return Err(Error::RuntimeClosed),
-                _ => {}
-            }
-            events.push(event);
-        }
-
-        Err(Error::RuntimeClosed)
-    }
-
-    fn poll_next_event(&mut self, cx: &mut Context<'_>) -> Poll<Option<AppServerEvent>> {
-        if self.terminated {
-            return Poll::Ready(None);
-        }
-
-        loop {
-            let event = match ready!(Pin::new(&mut self.rx).poll_next(cx)) {
-                Some(Ok(event)) => event,
-                Some(Err(BroadcastStreamRecvError::Lagged(skipped))) => {
-                    return Poll::Ready(Some(AppServerEvent::Lagged {
-                        skipped: skipped.try_into().unwrap_or(usize::MAX),
-                    }));
-                }
-                None => {
-                    self.terminate();
-                    return Poll::Ready(None);
-                }
-            };
-
-            if event_matches(&event, &self.thread_id, Some(&self.turn_id)) {
-                if is_terminal_turn_event(&event) {
-                    self.terminate();
-                }
-                return Poll::Ready(Some(event));
-            }
-        }
-    }
-
-    fn terminate(&mut self) {
-        self.terminated = true;
-        // A terminal event should not keep the thread locked because the
-        // caller retains the stream after inspecting its terminal event.
-        self.permit.take();
-    }
-}
-
-impl Stream for TurnStream {
-    type Item = AppServerEvent;
-
-    fn poll_next(self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<Option<Self::Item>> {
-        self.get_mut().poll_next_event(cx)
-    }
-}
-
-fn is_terminal_turn_event(event: &AppServerEvent) -> bool {
-    matches!(
-        event,
-        AppServerEvent::ServerNotification(ServerNotification::TurnCompleted(_))
-            | AppServerEvent::Disconnected { .. }
-    )
-}
-
 #[cfg(test)]
 mod tests {
-    use codex_app_server_protocol::{
-        Turn, TurnCompletedNotification, TurnItemsView, TurnStatus,
-    };
-    use serde::Deserialize;
-
     use super::*;
-
-    #[derive(Debug, Deserialize, PartialEq)]
-    struct StructuredAnswer {
-        title: String,
-        score: u8,
-    }
-
-    #[test]
-    fn final_response_as_deserializes_structured_json() {
-        let result = TurnResult {
-            thread_id: "thread".to_string(),
-            turn_id: "turn".to_string(),
-            final_response: r#"{"title":"ok","score":7}"#.to_string(),
-            events: Vec::new(),
-        };
-
-        let parsed: StructuredAnswer = result.final_response_as().unwrap();
-
-        assert_eq!(
-            parsed,
-            StructuredAnswer {
-                title: "ok".to_string(),
-                score: 7,
-            }
-        );
-    }
-
-    #[test]
-    fn turn_stream_implements_stream() {
-        fn assert_stream<T: Stream<Item = AppServerEvent>>() {}
-
-        assert_stream::<TurnStream>();
-    }
-
-    #[test]
-    fn turn_stream_terminal_events_are_explicit() {
-        let completed = AppServerEvent::ServerNotification(
-            ServerNotification::TurnCompleted(TurnCompletedNotification {
-                thread_id: "thread-1".to_string(),
-                turn: Turn {
-                    id: "turn-1".to_string(),
-                    items: Vec::new(),
-                    items_view: TurnItemsView::Full,
-                    status: TurnStatus::Completed,
-                    error: None,
-                    started_at: Some(1),
-                    completed_at: Some(2),
-                    duration_ms: Some(1_000),
-                },
-            }),
-        );
-        let disconnected = AppServerEvent::Disconnected {
-            message: "runtime closed".to_string(),
-        };
-
-        assert!(is_terminal_turn_event(&completed));
-        assert!(is_terminal_turn_event(&disconnected));
-        assert!(!is_terminal_turn_event(&AppServerEvent::Lagged {
-            skipped: 1,
-        }));
-    }
 
     #[test]
     fn turn_params_with_input_stores_string_as_native_text_input() {

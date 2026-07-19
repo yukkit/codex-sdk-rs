@@ -1,4 +1,5 @@
 use codex_sdk::prelude::*;
+use tokio_stream::StreamExt;
 
 fn main() -> anyhow::Result<()> {
     codex_sdk::run_main(|ctx| async move {
@@ -13,14 +14,31 @@ fn main() -> anyhow::Result<()> {
             .start()
             .await?;
 
-        let result = codex
-            .turn("Describe the current working directory in one sentence.")
+        let thread = codex
+            .thread()
             .sandbox(SandboxMode::ReadOnly)
             .approval_policy(AskForApproval::Never)
-            .send()
+            .start()
             .await?;
+        let mut events = thread.event_stream()?;
+        let turn = thread
+            .turn("Describe the current working directory in one sentence.")
+            .start()
+            .await?;
+        let turn_id = turn.turn_id().to_string();
 
-        println!("{}", result.final_response());
+        while let Some(event) = events.next().await {
+            match event {
+                AppServerEvent::ServerNotification(
+                    ServerNotification::AgentMessageDelta(delta),
+                ) if delta.turn_id == turn_id => print!("{}", delta.delta),
+                AppServerEvent::ServerNotification(
+                    ServerNotification::TurnCompleted(done),
+                ) if done.turn.id == turn_id => break,
+                _ => {}
+            }
+        }
+        println!();
         codex.shutdown().await?;
         Ok(())
     })

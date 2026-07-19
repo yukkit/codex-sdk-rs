@@ -1,5 +1,6 @@
 use std::collections::{BTreeMap, HashMap};
 use std::path::{Path, PathBuf};
+use std::sync::atomic::{AtomicBool, Ordering};
 
 pub use codex_otel::{
     OtelExporter, OtelHttpProtocol, OtelProvider, OtelSettings, OtelTlsConfig,
@@ -38,9 +39,17 @@ impl Observability {
 /// [`shutdown`](Self::shutdown) when you need deterministic shutdown earlier.
 pub struct ObservabilityGuard {
     provider: Option<OtelProvider>,
+    is_shutdown: AtomicBool,
 }
 
 impl ObservabilityGuard {
+    fn new(provider: Option<OtelProvider>) -> Self {
+        Self {
+            provider,
+            is_shutdown: AtomicBool::new(false),
+        }
+    }
+
     /// The underlying Codex OpenTelemetry provider, when exporters are enabled.
     pub fn provider(&self) -> Option<&OtelProvider> {
         self.provider.as_ref()
@@ -48,6 +57,9 @@ impl ObservabilityGuard {
 
     /// Flush and shut down telemetry exporters.
     pub fn shutdown(&self) {
+        if self.is_shutdown.swap(true, Ordering::AcqRel) {
+            return;
+        }
         if let Some(provider) = &self.provider {
             provider.shutdown();
         }
@@ -56,9 +68,7 @@ impl ObservabilityGuard {
 
 impl Drop for ObservabilityGuard {
     fn drop(&mut self) {
-        if let Some(provider) = &self.provider {
-            provider.shutdown();
-        }
+        self.shutdown();
     }
 }
 
@@ -154,7 +164,7 @@ impl ObservabilityBuilder {
             self.settings.runtime_metrics = runtime_metrics;
         }
 
-        self.apply_resource_attributes();
+        self.apply_resource_attributes()?;
         self.settings.exporter = exporter_from_env(Signal::Logs)?;
         self.settings.trace_exporter = exporter_from_env(Signal::Traces)?;
         self.settings.metrics_exporter = exporter_from_env(Signal::Metrics)?;
@@ -305,27 +315,27 @@ impl ObservabilityBuilder {
 
     /// Build the OpenTelemetry provider without installing a subscriber.
     pub fn build_provider(self) -> Result<ObservabilityGuard> {
-        let provider =
-            OtelProvider::from(&self.settings).map_err(Error::observability)?;
-        Ok(ObservabilityGuard { provider })
+        let provider = OtelProvider::from(&self.settings)
+            .map_err(|error| Error::observability_message(error.to_string()))?;
+        Ok(ObservabilityGuard::new(provider))
     }
 
     /// Build the provider and install the configured tracing subscriber.
     pub fn install(self) -> Result<ObservabilityGuard> {
-        let provider =
-            OtelProvider::from(&self.settings).map_err(Error::observability)?;
+        let provider = OtelProvider::from(&self.settings)
+            .map_err(|error| Error::observability_message(error.to_string()))?;
         if self.install_subscriber {
             install_subscriber(provider.as_ref(), self.env_filter, self.fmt_layer)?;
         }
-        Ok(ObservabilityGuard { provider })
+        Ok(ObservabilityGuard::new(provider))
     }
 
-    fn apply_resource_attributes(&mut self) {
+    fn apply_resource_attributes(&mut self) -> Result<()> {
         let Some(attributes) = first_env(&["OTEL_RESOURCE_ATTRIBUTES"]) else {
-            return;
+            return Ok(());
         };
 
-        for (key, value) in parse_key_value_list(&attributes).unwrap_or_default() {
+        for (key, value) in parse_key_value_list(&attributes)? {
             match key.as_str() {
                 "service.name" => self.settings.service_name = value,
                 "service.version" => self.settings.service_version = value,
@@ -337,6 +347,7 @@ impl ObservabilityBuilder {
                 }
             }
         }
+        Ok(())
     }
 }
 
@@ -396,7 +407,7 @@ fn exporter_from_env(signal: Signal) -> Result<OtelExporter> {
             protocol: OtelHttpProtocol::Json,
             tls: None,
         }),
-        other => Err(Error::observability(format!(
+        other => Err(Error::observability_message(format!(
             "unsupported OTEL protocol {other:?}"
         ))),
     }
@@ -423,7 +434,7 @@ fn parse_key_value_list(input: &str) -> Result<Vec<(String, String)>> {
         })
         .map(|part| {
             let (key, value) = part.split_once('=').ok_or_else(|| {
-                Error::observability(format!(
+                Error::observability_message(format!(
                     "expected key=value entry in comma-separated list: {part:?}"
                 ))
             })?;
@@ -433,9 +444,11 @@ fn parse_key_value_list(input: &str) -> Result<Vec<(String, String)>> {
 }
 
 fn first_env(keys: &[&str]) -> Option<String> {
-    keys.iter()
-        .find_map(|key| std::env::var(key).ok())
-        .filter(|value| !value.trim().is_empty())
+    first_non_empty(keys.iter().filter_map(|key| std::env::var(key).ok()))
+}
+
+fn first_non_empty(values: impl IntoIterator<Item = String>) -> Option<String> {
+    values.into_iter().find(|value| !value.trim().is_empty())
 }
 
 fn env_bool(key: &str) -> Option<bool> {
@@ -477,5 +490,23 @@ impl Signal {
             Self::Traces => "OTEL_EXPORTER_OTLP_TRACES_HEADERS",
             Self::Metrics => "OTEL_EXPORTER_OTLP_METRICS_HEADERS",
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn first_non_empty_skips_empty_higher_priority_values() {
+        assert_eq!(
+            first_non_empty(["  ".to_string(), "fallback".to_string()]),
+            Some("fallback".to_string())
+        );
+    }
+
+    #[test]
+    fn key_value_list_rejects_malformed_entries() {
+        assert!(parse_key_value_list("valid=one,invalid").is_err());
     }
 }

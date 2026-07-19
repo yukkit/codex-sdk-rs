@@ -6,9 +6,10 @@ to work directly with the Codex app-server JSON-RPC protocol, `AppServerClient`,
 Rust API:
 
 - `Codex`: a shared Codex runtime.
-- `Thread`: a Codex thread that can continue a conversation.
-- `TurnBuilder` / `TurnHandle` / `TurnStream`: one user request, optional
-  active-turn control, and its event stream.
+- `Thread` / `ThreadEventStream`: a conversation and its single long-lived
+  stream of events across all turns.
+- `TurnBuilder` / `TurnHandle`: one user request and optional active-turn
+  control.
 - `ServerRequest`: native Codex requests, such as command approvals and MCP
   elicitations.
 - `Observability`: the entry point for tracing / OpenTelemetry initialization.
@@ -17,6 +18,7 @@ Rust API:
 
 ```rust,no_run
 use codex_sdk::prelude::*;
+use tokio_stream::StreamExt;
 
 fn main() -> anyhow::Result<()> {
     codex_sdk::run_main(|ctx| async move {
@@ -34,13 +36,29 @@ fn main() -> anyhow::Result<()> {
             .start()
             .await?;
 
-        let result = codex
-            .turn("Summarize this repository in one paragraph.")
+        let thread = codex
+            .thread()
             .cwd(std::env::current_dir()?)
-            .send()
+            .start()
             .await?;
+        let mut events = thread.event_stream()?;
+        let turn = thread
+            .turn("Summarize this repository in one paragraph.")
+            .start()
+            .await?;
+        let turn_id = turn.turn_id().to_string();
 
-        println!("{}", result.final_response());
+        while let Some(event) = events.next().await {
+            println!("{event:?}");
+            if matches!(
+                event,
+                AppServerEvent::ServerNotification(
+                    ServerNotification::TurnCompleted(ref done)
+                ) if done.turn.id == turn_id
+            ) {
+                break;
+            }
+        }
         codex.shutdown().await?;
         Ok(())
     })
@@ -291,22 +309,24 @@ Recommendations:
 
 - User-facing Web/UI products: `OnRequest`, and show the `ServerRequest` plus
   request id to the user.
-- Trusted automation that should fail closed: `Never` with synchronous
-  `send()`; requests that require approval will be rejected by the SDK.
+- Trusted automation without an interactive approval channel: `Never`; consume
+  the thread stream until the matching `TurnCompleted` and handle error events
+  explicitly.
 - More conservative interactive workflows: `UnlessTrusted`.
 
 Because this is the native Codex type, granular policy can be passed directly
 with `AskForApproval::Granular`; long-lived defaults can also remain in
 `config.toml`.
 
-## One-shot Turns
+## Temporary-thread Turns
 
 `codex.turn(input)` is a convenience path: it creates a temporary thread, starts
-one turn, and collects the final text. `input` can be `&str` / `String` or native
-`Vec<UserInput>`.
+one turn, and returns a `TurnHandle`. `input` can be `&str` / `String` or native
+`Vec<UserInput>`. Take the long-lived event stream from the handle's owning
+thread.
 
 ```rust,no_run
-let result = codex
+let turn = codex
     .turn("Review the current repository and summarize the risks.")
     .cwd("/workspace/repo")
     .sandbox(SandboxMode::ReadOnly)
@@ -325,17 +345,15 @@ let result = codex
         "required": ["summary", "risks"],
         "additionalProperties": false
     }))
-    .timeout(std::time::Duration::from_secs(300))
-    .send()
+    .start()
     .await?;
-
-println!("{}", result.final_response());
+let mut events = turn.thread().event_stream()?;
 ```
 
 For multimodal or lower-level input, pass native `UserInput` directly:
 
 ```rust,no_run
-let result = codex
+let turn = codex
     .turn(vec![
         UserInput::Text {
             text: "Describe this image.".into(),
@@ -346,13 +364,13 @@ let result = codex
             detail: None,
         },
     ])
-    .send()
+    .start()
     .await?;
+let mut events = turn.thread().event_stream()?;
 ```
 
-This path fits synchronous HTTP APIs, CLI wrappers, and CI tasks. It is not a
-good fit for interactive UIs that need human approvals or complex MCP
-elicitations.
+The temporary thread remains accessible through `turn.thread()` and can be
+resumed later when it is not configured as ephemeral.
 
 ## Reusing Threads
 
@@ -368,18 +386,34 @@ let thread = codex
     .ephemeral(true)
     .start()
     .await?;
+let mut events = thread.event_stream()?;
 
-let _first = thread.turn("Draft a repair plan first.").send().await?;
-let second = thread.run("Implement the first step from that plan.").await?;
+let first = thread
+    .turn("Draft a repair plan first.")
+    .start()
+    .await?;
+while let Some(event) = events.next().await {
+    if matches!(
+        event,
+        AppServerEvent::ServerNotification(ServerNotification::TurnCompleted(ref done))
+            if done.turn.id == first.turn_id()
+    ) {
+        break;
+    }
+}
+
+let second = thread
+    .turn("Implement the first step from that plan.")
+    .start()
+    .await?;
 ```
 
-By default, the same `Thread` allows only one active turn at a time. A second
-`turn.stream().await` waits until the previous `TurnStream` completes or is
-dropped. Different `Thread`s can run concurrently.
-
-`Thread::run(input)` is the shortest path and uses the thread's current default
-turn options. Use `thread.turn(input).xxx(...).send().await?` when you need to
-set model, sandbox, reasoning, output schema, or other turn options.
+The SDK does not serialize turns for a thread ID. Applications must wait for
+the previous turn's `TurnCompleted` event, or otherwise coordinate access,
+before starting another turn on the same thread ID. Keep the same
+`ThreadEventStream` for the thread's entire lifetime; `TurnCompleted` does not
+end it. Dropping the stream only stops local consumption and does not interrupt
+the server turn. Different thread IDs can run concurrently.
 
 Saved threads can be resumed, forked, listed, archived, and unarchived through
 the shared `Codex` handle:
@@ -446,22 +480,24 @@ Interactive UIs should use streaming:
 ```rust,no_run
 use tokio_stream::StreamExt;
 
-let mut stream = thread
+let mut stream = thread.event_stream()?;
+let turn = thread
     .turn("Run the pg MCP smoke test.")
     .approval_policy(AskForApproval::OnRequest)
-    .stream()
+    .start()
     .await?;
+let turn_id = turn.turn_id().to_string();
 
 while let Some(event) = StreamExt::next(&mut stream).await {
     match event {
         AppServerEvent::ServerNotification(
             ServerNotification::AgentMessageDelta(delta),
-        ) => {
+        ) if delta.turn_id == turn_id => {
             print!("{}", delta.delta);
         }
         AppServerEvent::ServerNotification(
             ServerNotification::TurnCompleted(done),
-        ) => {
+        ) if done.turn.id == turn_id => {
             eprintln!("turn completed: {:?}", done.turn.status);
             break;
         }
@@ -478,28 +514,29 @@ while let Some(event) = StreamExt::next(&mut stream).await {
 }
 ```
 
-If you need to steer or interrupt a turn before or while consuming the stream,
-start it as a `TurnHandle`:
+Steering and interruption stay on the `TurnHandle`, independently of the
+thread's event stream:
 
 ```rust,no_run
 use tokio_stream::StreamExt;
 
+let mut stream = thread.event_stream()?;
 let turn = thread.turn("Count from 1 to 100.").start().await?;
 turn.steer("Stop after 10 numbers.").await?;
 
-let mut stream = turn.stream();
 while let Some(event) = StreamExt::next(&mut stream).await {
     if matches!(
         event,
-        AppServerEvent::ServerNotification(ServerNotification::TurnCompleted(_))
+        AppServerEvent::ServerNotification(ServerNotification::TurnCompleted(ref done))
+            if done.turn.id == turn.turn_id()
     ) {
         break;
     }
 }
 ```
 
-`TurnStream` also exposes `steer(...)` and `interrupt()` so a UI can keep one
-object while consuming events and sending control requests.
+`TurnCompleted` is a per-turn boundary only. Continue polling the same
+`ThreadEventStream` for later turns.
 
 Common events:
 
@@ -515,10 +552,8 @@ protocol field and variant changes are exposed directly at compile time.
 
 Note: the underlying event distribution currently uses a broadcast channel.
 `Lagged` means this consumer has missed some events; interactive UIs should mark
-the current turn as needing refresh or retry. Synchronous `send()` collection
-still relies on receiving `TurnCompleted` before returning a complete
-`TurnResult`, so long-running or highly interactive scenarios should prefer
-`stream()` directly.
+the affected thread as needing refresh or retry. The SDK does not synthesize a
+batch result or hide native turn status; inspect `TurnCompleted` directly.
 
 ## Handling ServerRequest
 
@@ -580,8 +615,8 @@ codex
 ```
 
 Most `ServerRequest`s carry thread/turn ids, and the SDK delivers them only to
-the matching `TurnStream`. A small number of global Codex requests do not carry
-thread/turn ids and may be visible to multiple active streams. For those
+the matching `ThreadEventStream`. A small number of global Codex requests do not
+carry thread/turn ids and may be visible to multiple active streams. For those
 requests, de-duplicate at the application layer by `RequestId` and resolve or
 reject through the shared `Codex` handle.
 
@@ -610,11 +645,7 @@ let params = TurnStartParams {
     ..Default::default()
 };
 
-let result = thread
-    .turn_params(params)
-    .timeout(std::time::Duration::from_secs(300))
-    .send()
-    .await?;
+let turn = thread.turn_params(params).start().await?;
 ```
 
 Fields:
@@ -640,9 +671,10 @@ Fields:
   field is `summary`.
 - `output_schema`: JSON Schema for the final assistant message; useful for
   structured results.
-- `timeout(...)`: SDK collection behavior, not part of native Codex
-  `TurnStartParams`; it only applies to `send()` collection paths, and streaming
-  callers should manage timeout/cancellation themselves.
+
+Streaming callers own timeout policy. A turn timeout should not discard the
+thread's long-lived stream; call `turn.interrupt().await` when cancellation is
+wanted and keep consuming thread events.
 
 ## Structured Output
 
@@ -670,20 +702,32 @@ let schema = serde_json::json!({
     "additionalProperties": false
 });
 
-let result = codex
+let turn = codex
     .turn("Summarize the risks in the current repository.")
     .approval_policy(AskForApproval::Never)
     .output_schema(schema)
-    .send()
+    .start()
     .await?;
+let turn_id = turn.turn_id().to_string();
+let mut events = turn.thread().event_stream()?;
 
-let summary: ReviewSummary = result.final_response_as()?;
+let mut response = String::new();
+while let Some(event) = events.next().await {
+    match event {
+        AppServerEvent::ServerNotification(
+            ServerNotification::AgentMessageDelta(delta),
+        ) if delta.turn_id == turn_id => response.push_str(&delta.delta),
+        AppServerEvent::ServerNotification(ServerNotification::TurnCompleted(done))
+            if done.turn.id == turn_id => break,
+        _ => {}
+    }
+}
+let summary: ReviewSummary = serde_json::from_str(&response)?;
 ```
 
-`final_response_json()` parses the response into `serde_json::Value`;
-`final_response_as<T>()` deserializes it directly into your type. The model
-still returns final content as an assistant message. The SDK only sends the
-schema and parses the final text.
+The model returns structured content through assistant-message events. The SDK
+sends the schema but deliberately leaves message selection and deserialization
+to the application instead of inventing a second batch result model.
 
 ## ThreadStartParams
 
@@ -804,7 +848,9 @@ Recommended structure:
 
 - Create one shared `Codex` when the process starts.
 - Create one `Thread` for each browser/business session.
-- Create one `TurnStream` for each user input.
+- Take one `ThreadEventStream` and keep it connected for that thread's lifetime.
+- Start a `Turn` for each user input; route its events by `turn_id` without
+  replacing the thread stream.
 - Convert `AppServerEvent` values into SSE/WebSocket events.
 - When a `ServerRequest` arrives, send the request id and native request content
   to the frontend. After the frontend approves or rejects it, send the request
@@ -822,15 +868,18 @@ to isolate `CODEX_HOME`, providers, MCP, or local state.
 codex.shutdown().await?;
 ```
 
+Dropping the final `Codex`, `Thread`, `TurnHandle`, or `ThreadEventStream` also
+signals runtime shutdown. Call `shutdown()` explicitly when the service needs
+to await bounded cleanup and observe shutdown errors.
+
 `ObservabilityGuard` tries to flush on drop. If you need deterministic flushing:
 
 ```rust,no_run
 observability.shutdown();
 ```
 
-Long-lived connection services should wire process shutdown signals into
-SSE/WebSocket handling; otherwise graceful shutdown may wait forever for
-infinite streams to end naturally.
+Long-lived connection services should still wire process shutdown signals into
+their SSE/WebSocket handling so downstream clients are closed deliberately.
 
 ## Error Handling
 
@@ -839,11 +888,12 @@ The SDK error type is `codex_sdk::Error`:
 - `Config`: Codex config failed to load.
 - `RuntimeStart`: app-server runtime failed to start.
 - `RuntimeClosed`: runtime/event stream closed.
+- `ThreadEventStreamTaken`: the thread's single event stream was already taken
+  from this handle or one of its clones.
 - `RuntimeTask`: runtime background task failed during shutdown.
+- `RuntimeShutdown` / `RuntimeShutdownTimeout`: bounded runtime cleanup failed.
 - `Protocol`: JSON-RPC/app-server protocol error.
-- `Timeout`: synchronous turn collection timed out.
-- `TurnFailed`: turn failed.
-- `Approval`: server request resolve/reject failed.
+- `Approval` / `ServerRequestResponseTimeout`: server request response failed.
 - `Observability`: OTel/tracing initialization failed.
 
 Server-side APIs should map these errors to structured error responses while

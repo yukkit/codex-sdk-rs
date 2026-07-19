@@ -43,15 +43,15 @@ preserving Rust builder style and native Codex protocol escape hatches.
 | List/fork/archive | No high-level API | `thread_list` / `thread_fork` / `thread_archive` / `thread_unarchive` | `list_threads` / `fork_thread` / `archive_thread` / `unarchive_thread`, plus `Thread::fork` / `Thread::archive` | Rust is currently closer to Python. |
 | Read/name/compact thread | None | `thread.read(...)` / `set_name(...)` / `compact()` | `Thread::read(...)` / `set_name(...)` / `compact()` | Rust is aligned with Python's common thread operations. |
 | Thread source/session source | None | `thread_start(session_start_source=..., thread_source=...)`, `thread_fork(thread_source=...)` | Default `ThreadSource::User`; full control through `ThreadStartParams` / `ThreadForkParams` | Rust avoids a dedicated high-level setter for low-frequency protocol metadata. |
-| One complete turn | `thread.run(input, turnOptions)` | `thread.run(input, approval_mode=..., model=..., sandbox=..., output_schema=...)` | `thread.run(input).await?` | Rust keeps this as the shortest path using the thread's current default turn config. Use `thread.turn(input).xxx(...).send().await?` when parameters are needed. |
+| One complete turn | `thread.run(input, turnOptions)` | `thread.run(input, approval_mode=..., model=..., sandbox=..., output_schema=...)` | Start with `thread.turn(input).start().await?`, then consume the matching `TurnCompleted` from the thread event stream | Rust intentionally exposes native turn status instead of a batch result. |
 | Build/start controllable turn | No handle; only `run` or `runStreamed` | `thread.turn(input, ...) -> TurnHandle` | `thread.turn(input).start().await? -> TurnHandle` | Rust is aligned with Python's handle concept. |
-| Streaming | `thread.runStreamed(input, turnOptions)` returns `AsyncGenerator<ThreadEvent>` | `turn.stream()` returns a notification iterator / async iterator | `thread.turn(input).stream().await?` or `thread.turn(input).start().await?.stream()` | Rust supports taking the stream directly or after getting a handle. |
-| Steer / interrupt | None; `TurnOptions.signal` can abort a CLI run | `TurnHandle.steer(...)` / `interrupt()` | `TurnHandle::steer(...)` / `interrupt()`; `TurnStream` supports these too | Rust adds stream-scoped convenience for streaming UIs. |
-| Top-level one-off turn | None | No dedicated top-level API; callers start a thread first | `codex.turn(input).send().await?` / `codex.turn_params(params)` | Rust provides temporary-thread convenience for server requests, CI, and CLI scenarios. |
+| Streaming | `thread.runStreamed(input, turnOptions)` returns `AsyncGenerator<ThreadEvent>` | `turn.stream()` returns a notification iterator / async iterator | Take `thread.event_stream()?` once and keep it across turns | Rust models the app-server lifecycle directly: one long-lived event stream belongs to each thread. |
+| Steer / interrupt | None; `TurnOptions.signal` can abort a CLI run | `TurnHandle.steer(...)` / `interrupt()` | `TurnHandle::steer(...)` / `interrupt()` | Rust keeps active-turn control separate from thread event consumption. |
+| Top-level one-off turn | None | No dedicated top-level API; callers start a thread first | `codex.turn(input).start().await?` / `codex.turn_params(params)` | The returned `TurnHandle` exposes its temporary owning thread through `thread()`. |
 | Input types | `Input` is a string or `UserInput[]`; `UserInput` only has text/local image | `str` or `TextInput` / `ImageInput` / `LocalImageInput` / `SkillInput` / `MentionInput` / list | `impl IntoTurnInput`, supporting `&str` / `String` / native `UserInput` / `Vec<UserInput>` | Rust reuses native app-server `UserInput`, covering text, image, localImage, skill, and mention. |
-| Turn options | Only `outputSchema` / `signal`; model/sandbox/approval live in `ThreadOptions` | `run` / `turn` accept approval, cwd, effort, model, output_schema, personality, sandbox, service_tier, summary | `TurnBuilder` / `CodexTurnBuilder` provide similar setters and can accept full `TurnStartParams` | Rust does not copy a large parameter set onto `Thread::run`, avoiding duplication with the builder. |
-| Structured output | `TurnOptions.outputSchema` | `output_schema=` | `output_schema(...)` plus `TurnResult::final_response_as<T>()` | Aligned. |
-| Result shape | `Turn { items, finalResponse, usage }` | `TurnResult { id, status, error, times, final_response, items, usage }` | `TurnResult { thread_id, turn_id, final_response, events }` | Rust keeps full events today but does not yet lift status/usage/items into high-level fields. |
+| Turn options | Only `outputSchema` / `signal`; model/sandbox/approval live in `ThreadOptions` | `run` / `turn` accept approval, cwd, effort, model, output_schema, personality, sandbox, service_tier, summary | `TurnBuilder` / `CodexTurnBuilder` provide similar setters and can accept full `TurnStartParams` | Rust keeps turn configuration on builders. |
+| Structured output | `TurnOptions.outputSchema` | `output_schema=` | `output_schema(...)`; applications deserialize assistant-message events | Rust avoids choosing or concatenating message items on the caller's behalf. |
+| Result shape | `Turn { items, finalResponse, usage }` | `TurnResult { id, status, error, times, final_response, items, usage }` | Long-lived native `AppServerEvent` stream; each turn emits `TurnCompleted` | Status, errors, items, and usage remain protocol-native. |
 | Reasoning | `ThreadOptions.modelReasoningEffort`; no summary | Turn params `effort` / `summary` | Runtime defaults `reasoning_effort` / `reasoning_summary`; turn overrides `effort` / `reasoning_summary` / `summary` | Rust covers the common fields. |
 | Sandbox / filesystem | `ThreadOptions.sandboxMode`, `networkAccessEnabled`, `additionalDirectories` | `Sandbox` presets; detailed fields require lower-level config/protocol | Thread default `SandboxMode`; turn-level `sandbox(SandboxMode)` and `sandbox_policy(SandboxPolicy)` | Rust's `sandbox_policy` is the fine-grained network/writable-roots escape hatch. |
 | Web search / network | `webSearchMode` / `webSearchEnabled` / `networkAccessEnabled` | No high-level turn setter | No high-level web-search setter; network can be controlled through `SandboxPolicy` or native `Config`/params | These are lower-frequency or more change-prone options, so there is no high-level API yet. |
@@ -65,7 +65,7 @@ preserving Rust builder style and native Codex protocol escape hatches.
 
 ## Current Tradeoffs
 
-### `Thread::run`
+### Streaming-only turns
 
 Python's `Thread.run(...)` can take turn parameters directly:
 
@@ -84,27 +84,24 @@ thread.run(
 )
 ```
 
-Rust currently keeps a more explicit builder style:
+Rust keeps a builder and one native event stream per thread:
 
 ```rust,no_run
-let result = thread
+let mut events = thread.event_stream()?;
+let turn = thread
     .turn("Review this diff.")
     .model("gpt-5.x")
     .sandbox(SandboxMode::ReadOnly)
     .effort(ReasoningEffort::High)
-    .send()
+    .start()
     .await?;
 ```
 
-`Thread::run(input).await?` remains the shortest path, equivalent to:
-
-```rust,no_run
-thread.turn(input).send().await
-```
-
-Do not add `run_with` / `run_params` for now, to avoid growing the API surface
-too early. If users later clearly prefer the Python style, add a builder
-callback or params convenience.
+There is no `Thread::run`, `send`, or SDK-owned collector. This keeps failure,
+interruption, multiple message items, approvals, and usage visible as native
+events instead of collapsing them into an ambiguous final string. Applications
+match events by `turn.turn_id()` when they need a per-turn view; the stream
+itself remains attached to the thread.
 
 ### Native Escape Hatch
 
@@ -124,7 +121,7 @@ protocol field. Principles:
 ### Prelude Strategy
 
 `prelude` only contains types that are used frequently in day-to-day code:
-`Codex`, builders, `Thread`, `TurnBuilder`, `TurnHandle`, `TurnStream`,
+`Codex`, builders, `Thread`, `ThreadEventStream`, `TurnBuilder`, `TurnHandle`,
 `Account`, `Model`, core params, `SandboxMode`, `SandboxPolicy`,
 `AskForApproval`, `ReasoningEffort`, `ReasoningSummary`, `UserInput`, and
 similar types.
@@ -139,9 +136,7 @@ let page: codex_sdk::ThreadListResponse = codex.list_threads().await?;
 
 1. Add `login_api_key` / `login_chatgpt` / `logout` so the SDK can complete
    auth flows independently.
-2. Add high-level `items` / `usage` / `status` fields to `TurnResult`, closer to
-   TS/Python result shapes.
-3. Add a retry helper if production demand calls for one, closer to Python's
+2. Add a retry helper if production demand calls for one, closer to Python's
    `retry_on_overload`.
-4. Reevaluate naming consistency if the TS SDK changes from a CLI wrapper into
+3. Reevaluate naming consistency if the TS SDK changes from a CLI wrapper into
    an app-server SDK.

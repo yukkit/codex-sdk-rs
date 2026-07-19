@@ -1,46 +1,92 @@
-use std::sync::Arc;
+use std::pin::Pin;
+use std::sync::{Arc, Mutex, PoisonError};
+use std::task::{Context, Poll, ready};
 
+use codex_app_server_client::AppServerEvent;
 use codex_app_server_protocol::{
-    AskForApproval, ClientRequest, SandboxMode, ThreadArchiveResponse,
-    ThreadCompactStartParams, ThreadCompactStartResponse, ThreadForkParams,
-    ThreadReadParams, ThreadReadResponse, ThreadSetNameParams, ThreadSetNameResponse,
-    ThreadSource, ThreadStartParams, ThreadStartResponse, TurnStartParams,
+    AskForApproval, ClientRequest, RequestId, SandboxMode, ServerNotification,
+    ThreadArchiveResponse, ThreadCompactStartParams, ThreadCompactStartResponse,
+    ThreadForkParams, ThreadReadParams, ThreadReadResponse, ThreadSetNameParams,
+    ThreadSetNameResponse, ThreadSource, ThreadStartParams, ThreadStartResponse,
+    TurnStartParams,
 };
 use codex_protocol::config_types::Personality;
-use tokio::sync::{OwnedSemaphorePermit, Semaphore};
+use tokio::sync::broadcast;
+use tokio_stream::Stream;
+use tokio_stream::wrappers::BroadcastStream;
+use tokio_stream::wrappers::errors::BroadcastStreamRecvError;
 
 use crate::client::Codex;
 use crate::error::{Error, Result};
-use crate::turn::{IntoTurnInput, TurnBuilder, TurnResult};
+use crate::event::event_matches;
+use crate::turn::{IntoTurnInput, TurnBuilder};
 use crate::types::{ThreadId, cwd_to_string};
 
 /// Reusable Codex conversation thread.
 ///
-/// A thread keeps Codex context across turns. This SDK serializes active turns
-/// on the same thread so event routing, approvals, and context updates stay
-/// ordered.
+/// A thread keeps Codex context across turns. Callers must not start overlapping
+/// turns for the same thread ID; the SDK does not serialize them.
 #[derive(Clone)]
 pub struct Thread {
+    /// State shared by control handles and all clones of this thread.
+    inner: Arc<ThreadInner>,
+}
+
+struct ThreadInner {
     /// Shared Codex runtime that owns this thread.
     codex: Codex,
     /// Codex-assigned thread id.
     id: ThreadId,
-    /// Single permit used to serialize active turns on this thread.
-    turn_permits: Arc<Semaphore>,
+    /// The thread's receiver is unique even when its control handle is cloned.
+    event_rx: Mutex<Option<broadcast::Receiver<AppServerEvent>>>,
 }
 
 impl Thread {
-    pub(crate) fn from_id(codex: Codex, id: ThreadId) -> Self {
+    pub(crate) fn from_id(
+        codex: Codex,
+        id: ThreadId,
+        event_rx: broadcast::Receiver<AppServerEvent>,
+    ) -> Self {
         Self {
-            codex,
-            id,
-            turn_permits: Arc::new(Semaphore::new(1)),
+            inner: Arc::new(ThreadInner {
+                codex,
+                id,
+                event_rx: Mutex::new(Some(event_rx)),
+            }),
         }
     }
 
     /// Codex-assigned thread id.
     pub fn id(&self) -> &str {
-        &self.id
+        &self.inner.id
+    }
+
+    /// Take this thread's long-lived event stream.
+    ///
+    /// The stream contains every event associated with this thread across all
+    /// of its turns. `TurnCompleted` is an ordinary event and does not end the
+    /// stream. The stream ends when the thread or runtime closes.
+    ///
+    /// A thread has exactly one event stream, shared across all clones of its
+    /// handle. Calling this method more than once returns
+    /// [`Error::ThreadEventStreamTaken`].
+    pub fn event_stream(&self) -> Result<ThreadEventStream> {
+        let mut event_rx = self
+            .inner
+            .event_rx
+            .lock()
+            .unwrap_or_else(PoisonError::into_inner);
+        let event_rx = event_rx
+            .take()
+            .ok_or_else(|| Error::ThreadEventStreamTaken {
+                thread_id: self.id().to_string(),
+            })?;
+
+        Ok(ThreadEventStream {
+            thread: self.clone(),
+            event_rx: BroadcastStream::new(event_rx),
+            terminated: false,
+        })
     }
 
     /// Start building a turn from user input.
@@ -53,25 +99,14 @@ impl Thread {
         TurnBuilder::from_params(self.clone(), params)
     }
 
-    /// Start a turn with default options, wait for completion, and collect its
-    /// final result.
-    ///
-    /// Use [`turn`](Self::turn) when you need to configure model, sandbox,
-    /// reasoning, output schema, or other turn options before collecting with
-    /// [`TurnBuilder::send`](crate::TurnBuilder::send).
-    pub async fn run(&self, input: impl IntoTurnInput) -> Result<TurnResult> {
-        self.turn(input).send().await
-    }
-
     /// Read this thread from Codex state.
     pub async fn read(&self, include_turns: bool) -> Result<ThreadReadResponse> {
-        self.codex
-            .inner
-            .runtime
+        self.inner
+            .codex
             .request_typed(ClientRequest::ThreadRead {
-                request_id: self.codex.inner.runtime.next_request_id(),
+                request_id: self.inner.codex.next_request_id(),
                 params: ThreadReadParams {
-                    thread_id: self.id.clone(),
+                    thread_id: self.inner.id.clone(),
                     include_turns,
                 },
             })
@@ -83,13 +118,12 @@ impl Thread {
         &self,
         name: impl Into<String>,
     ) -> Result<ThreadSetNameResponse> {
-        self.codex
-            .inner
-            .runtime
+        self.inner
+            .codex
             .request_typed(ClientRequest::ThreadSetName {
-                request_id: self.codex.inner.runtime.next_request_id(),
+                request_id: self.inner.codex.next_request_id(),
                 params: ThreadSetNameParams {
-                    thread_id: self.id.clone(),
+                    thread_id: self.inner.id.clone(),
                     name: name.into(),
                 },
             })
@@ -98,13 +132,12 @@ impl Thread {
 
     /// Start compaction for this thread.
     pub async fn compact(&self) -> Result<ThreadCompactStartResponse> {
-        self.codex
-            .inner
-            .runtime
+        self.inner
+            .codex
             .request_typed(ClientRequest::ThreadCompactStart {
-                request_id: self.codex.inner.runtime.next_request_id(),
+                request_id: self.inner.codex.next_request_id(),
                 params: ThreadCompactStartParams {
-                    thread_id: self.id.clone(),
+                    thread_id: self.inner.id.clone(),
                 },
             })
             .await
@@ -112,31 +145,122 @@ impl Thread {
 
     /// Fork this thread into a new reusable thread.
     pub async fn fork(&self) -> Result<Thread> {
-        self.codex.fork_thread(self.id.clone()).await
+        self.inner.codex.fork_thread(self.inner.id.clone()).await
     }
 
     /// Fork this thread using native `thread/fork` params.
     pub async fn fork_params(&self, mut params: ThreadForkParams) -> Result<Thread> {
-        params.thread_id = self.id.clone();
-        self.codex.fork_thread_params(params).await
+        params.thread_id = self.inner.id.clone();
+        self.inner.codex.fork_thread_params(params).await
     }
 
     /// Archive this thread.
     pub async fn archive(&self) -> Result<ThreadArchiveResponse> {
-        self.codex.archive_thread(self.id.clone()).await
+        self.inner.codex.archive_thread(self.inner.id.clone()).await
     }
 
     pub(crate) fn codex(&self) -> &Codex {
-        &self.codex
+        &self.inner.codex
+    }
+}
+
+/// Long-lived stream of events for one [`Thread`].
+///
+/// This stream spans turns and yields thread-scoped requests and notifications,
+/// plus runtime-level lag and disconnection events. Dropping it stops local
+/// event consumption but does not interrupt an active turn.
+pub struct ThreadEventStream {
+    /// Owning thread, retained for its id, control API, and runtime lifetime.
+    thread: Thread,
+    /// Subscription created before the thread request, so early events survive.
+    event_rx: BroadcastStream<AppServerEvent>,
+    /// Set after the thread/runtime closes or the source channel ends.
+    terminated: bool,
+}
+
+impl ThreadEventStream {
+    /// Thread whose events this stream yields.
+    pub fn thread(&self) -> &Thread {
+        &self.thread
     }
 
-    pub(crate) async fn acquire_turn_permit(&self) -> Result<OwnedSemaphorePermit> {
-        self.turn_permits
-            .clone()
-            .acquire_owned()
-            .await
-            .map_err(|_| Error::Cancelled)
+    /// Thread id this stream is filtered to.
+    pub fn thread_id(&self) -> &str {
+        self.thread.id()
     }
+
+    /// Resolve a server request with a method-specific result payload.
+    pub async fn resolve_server_request(
+        &self,
+        request_id: RequestId,
+        result: impl serde::Serialize,
+    ) -> Result<()> {
+        self.thread
+            .codex()
+            .resolve_server_request(request_id, result)
+            .await
+    }
+
+    /// Resolve a server request with an empty JSON object.
+    pub async fn approve_server_request(&self, request_id: RequestId) -> Result<()> {
+        self.thread.codex().approve_server_request(request_id).await
+    }
+
+    /// Reject a server request with a human-readable message.
+    pub async fn reject_server_request(
+        &self,
+        request_id: RequestId,
+        message: impl Into<String>,
+    ) -> Result<()> {
+        self.thread
+            .codex()
+            .reject_server_request(request_id, message)
+            .await
+    }
+
+    fn poll_next_event(&mut self, cx: &mut Context<'_>) -> Poll<Option<AppServerEvent>> {
+        if self.terminated {
+            return Poll::Ready(None);
+        }
+
+        loop {
+            let event = match ready!(Pin::new(&mut self.event_rx).poll_next(cx)) {
+                Some(Ok(event)) => event,
+                Some(Err(BroadcastStreamRecvError::Lagged(skipped))) => {
+                    return Poll::Ready(Some(AppServerEvent::Lagged {
+                        skipped: skipped.try_into().unwrap_or(usize::MAX),
+                    }));
+                }
+                None => {
+                    self.terminated = true;
+                    return Poll::Ready(None);
+                }
+            };
+
+            if event_matches(&event, self.thread.id()) {
+                if is_terminal_thread_event(&event) {
+                    self.terminated = true;
+                }
+                return Poll::Ready(Some(event));
+            }
+        }
+    }
+}
+
+impl Stream for ThreadEventStream {
+    type Item = AppServerEvent;
+
+    fn poll_next(self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<Option<Self::Item>> {
+        self.get_mut().poll_next_event(cx)
+    }
+}
+
+fn is_terminal_thread_event(event: &AppServerEvent) -> bool {
+    matches!(
+        event,
+        AppServerEvent::ServerNotification(ServerNotification::ThreadClosed(_))
+            | AppServerEvent::Disconnected { .. }
+    )
 }
 
 /// Builder for creating a [`Thread`].
@@ -150,7 +274,7 @@ pub struct ThreadBuilder {
 impl ThreadBuilder {
     pub(crate) fn new(codex: Codex) -> Self {
         Self {
-            params: codex.inner.default_thread_params.clone(),
+            params: codex.default_thread_params().clone(),
             codex,
         }
     }
@@ -166,7 +290,8 @@ impl ThreadBuilder {
 
     /// Set the thread working directory.
     pub fn cwd(mut self, cwd: impl Into<std::path::PathBuf>) -> Self {
-        self.params.cwd = Some(cwd_to_string(cwd));
+        let cwd = cwd.into();
+        self.params.cwd = Some(cwd_to_string(&cwd));
         self
     }
 
@@ -240,12 +365,13 @@ impl ThreadBuilder {
             params.thread_source = Some(ThreadSource::User);
         }
 
+        // Subscribe before `thread/start`; app-server may emit `thread/started`
+        // before the request future resolves.
+        let event_rx = self.codex.runtime().subscribe();
         let response: ThreadStartResponse = self
             .codex
-            .inner
-            .runtime
             .request_typed(ClientRequest::ThreadStart {
-                request_id: self.codex.inner.runtime.next_request_id(),
+                request_id: self.codex.next_request_id(),
                 params,
             })
             .await?;
@@ -253,6 +379,57 @@ impl ThreadBuilder {
         let thread_id = response.thread.id;
         tracing::info!(%thread_id, "started Codex thread");
 
-        Ok(Thread::from_id(self.codex, thread_id))
+        Ok(Thread::from_id(self.codex, thread_id, event_rx))
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use codex_app_server_protocol::{
+        Turn, TurnCompletedNotification, TurnItemsView, TurnStatus,
+    };
+
+    use super::*;
+
+    #[test]
+    fn thread_event_stream_implements_stream() {
+        fn assert_stream<T: Stream<Item = AppServerEvent>>() {}
+
+        assert_stream::<ThreadEventStream>();
+    }
+
+    #[test]
+    fn turn_completion_does_not_terminate_thread_stream() {
+        let completed = AppServerEvent::ServerNotification(
+            ServerNotification::TurnCompleted(TurnCompletedNotification {
+                thread_id: "thread-1".to_string(),
+                turn: Turn {
+                    id: "turn-1".to_string(),
+                    items: Vec::new(),
+                    items_view: TurnItemsView::Full,
+                    status: TurnStatus::Completed,
+                    error: None,
+                    started_at: Some(1),
+                    completed_at: Some(2),
+                    duration_ms: Some(1_000),
+                },
+            }),
+        );
+        let closed =
+            AppServerEvent::ServerNotification(ServerNotification::ThreadClosed(
+                codex_app_server_protocol::ThreadClosedNotification {
+                    thread_id: "thread-1".to_string(),
+                },
+            ));
+        let disconnected = AppServerEvent::Disconnected {
+            message: "runtime closed".to_string(),
+        };
+
+        assert!(!is_terminal_thread_event(&completed));
+        assert!(is_terminal_thread_event(&closed));
+        assert!(is_terminal_thread_event(&disconnected));
+        assert!(!is_terminal_thread_event(&AppServerEvent::Lagged {
+            skipped: 1,
+        }));
     }
 }

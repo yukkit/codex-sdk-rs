@@ -48,7 +48,7 @@ Expected compile failures are useful signals. In particular:
 - `ServerRequest` match failures usually mean
   `src/event.rs::request_matches` needs a new routing rule.
 - `AppServerEvent` / `InProcessServerEvent` failures usually mean
-  `src/runtime.rs::spawn_event_loop` needs updates.
+  `src/runtime/mod.rs::spawn_event_loop` needs updates.
 
 ## 3. Review Protocol Changes
 
@@ -63,8 +63,8 @@ For every new or changed `ServerNotification`, decide:
 
 - Does it belong to a specific `thread_id`?
 - Does it belong to a specific `turn_id`?
-- Is it global and should active turn streams see it?
-- Does the batch `send()` aggregation path need to react to it?
+- Is it global and should active thread streams see it?
+- Does the thread stream need new terminal or routing behavior for it?
 
 For `ThreadStartParams` and `TurnStartParams`, decide:
 
@@ -78,28 +78,29 @@ For `ThreadStartParams` and `TurnStartParams`, decide:
 For every new or changed `ServerRequest`, decide:
 
 - Does it carry `thread_id` and/or `turn_id`?
-- Should it be delivered to one active turn stream or treated as global?
+- Should it be delivered to one active thread stream or treated as global?
 - What response type should callers pass to `Codex::resolve_server_request()`
-  or `TurnStream::resolve_server_request()`?
+  or `ThreadEventStream::resolve_server_request()`?
 - Is `approve_server_request()` with `{}` still valid for that request?
 
 ## 4. Recheck SDK Semantics
 
 Verify these SDK boundary assumptions still hold:
 
-- Turn streams should expose the native `AppServerEvent` directly.
+- Each `Thread` should expose one long-lived native `AppServerEvent` stream.
 - `AppServerEvent::ServerRequest` should expose the native `ServerRequest`
   directly. Runtime behavior such as resolve/reject belongs on `Codex` or
-  `TurnStream`.
-- `TurnBuilder::stream()` must subscribe before `turn/start` to avoid missing
-  fast events.
-- The batch `send()` path should fail closed for unhandled `ServerRequest`s.
+  `ThreadEventStream`.
+- Thread start/resume/fork/unarchive paths must subscribe before issuing their
+  lifecycle request, so the thread stream cannot miss fast initial events.
+- `TurnCompleted` must remain a normal event and must not end the thread stream.
+- `ServerRequest` variants must remain visible to matching thread streams.
 - Explicit `Codex::shutdown()` should notify streams with `Disconnected` and
   wait for the runtime task to exit.
-- One active turn per `Thread` should remain enforced unless the routing model is
-  redesigned.
+- The SDK should not add implicit turn serialization. Applications own the
+  no-overlap contract for turns sharing a thread ID.
 - Global `ServerRequest`s that lack thread/turn ids may be visible to multiple
-  active streams. If Codex adds more global requests, document the expected
+  active thread streams. If Codex adds more global requests, document the expected
   application-level de-duplication behavior.
 
 ## 5. Recheck Dependency Policy

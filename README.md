@@ -10,9 +10,9 @@ backends:
 - **Remote app-server**: connect to an already-running Codex app-server over
   WebSocket or Unix socket.
 
-The SDK exposes Codex's native `codex_app_server_client::AppServerEvent` for
-turn streams, including native server notifications, requests, lag, and
-disconnection events.
+The SDK exposes Codex's native `codex_app_server_client::AppServerEvent` through
+a long-lived stream owned by each thread, including native server
+notifications, requests, lag, and disconnection events.
 
 ## Status
 
@@ -35,6 +35,7 @@ Until a crates.io release is published, depend on the git repository directly:
 codex-sdk-rs = { git = "https://github.com/yukkit/codex-sdk-rs" }
 anyhow = "1"
 tokio = { version = "1", features = ["macros", "rt-multi-thread"] }
+tokio-stream = "0.1"
 ```
 
 The Cargo package name is `codex-sdk-rs`; the Rust import name is `codex_sdk`.
@@ -48,6 +49,7 @@ points such as shell, `apply_patch`, and the Linux sandbox before Tokio starts.
 
 ```rust,no_run
 use codex_sdk::prelude::*;
+use tokio_stream::StreamExt;
 
 fn main() -> anyhow::Result<()> {
     codex_sdk::run_main(|ctx| async move {
@@ -58,15 +60,32 @@ fn main() -> anyhow::Result<()> {
             .start()
             .await?;
 
-        let result = codex
-            .turn("Summarize this repository in one paragraph.")
+        let thread = codex
+            .thread()
             .cwd(std::env::current_dir()?)
             .sandbox(SandboxMode::ReadOnly)
             .approval_policy(AskForApproval::Never)
-            .send()
+            .start()
             .await?;
+        let mut events = thread.event_stream()?;
+        let turn = thread
+            .turn("Summarize this repository in one paragraph.")
+            .start()
+            .await?;
+        let turn_id = turn.turn_id().to_string();
 
-        println!("{}", result.final_response());
+        while let Some(event) = events.next().await {
+            match event {
+                AppServerEvent::ServerNotification(
+                    ServerNotification::AgentMessageDelta(delta),
+                ) if delta.turn_id == turn_id => print!("{}", delta.delta),
+                AppServerEvent::ServerNotification(
+                    ServerNotification::TurnCompleted(done),
+                ) if done.turn.id == turn_id => break,
+                _ => {}
+            }
+        }
+        println!();
         codex.shutdown().await?;
         Ok(())
     })
@@ -80,6 +99,7 @@ normal Tokio runtime.
 
 ```rust,no_run
 use codex_sdk::prelude::*;
+use tokio_stream::StreamExt;
 
 #[tokio::main]
 async fn main() -> anyhow::Result<()> {
@@ -89,12 +109,21 @@ async fn main() -> anyhow::Result<()> {
         .start()
         .await?;
 
-    let result = codex
-        .turn("Reply with one short sentence.")
-        .send()
-        .await?;
+    let thread = codex.thread().start().await?;
+    let mut events = thread.event_stream()?;
+    let turn = thread.turn("Reply with one short sentence.").start().await?;
+    let turn_id = turn.turn_id().to_string();
 
-    println!("{}", result.final_response());
+    while let Some(event) = events.next().await {
+        println!("{event:?}");
+        if matches!(
+            event,
+            AppServerEvent::ServerNotification(ServerNotification::TurnCompleted(ref done))
+                if done.turn.id == turn_id
+        ) {
+            break;
+        }
+    }
     codex.shutdown().await?;
     Ok(())
 }
@@ -111,10 +140,11 @@ a Unix socket.
 | `Codex::builder_with_config(config)` | Start in-process with a native `codex_core::config::Config`. |
 | `Codex::remote_websocket(url)` | Connect to a remote WebSocket app-server. |
 | `Codex::remote_unix_socket(path)` | Connect to a remote Unix-socket app-server. |
-| `codex.turn(input).send().await?` | Run one collected turn on a temporary thread. |
 | `codex.thread().start().await?` | Create a reusable thread. |
-| `thread.turn(input).stream().await?` | Stream native Codex notifications and server requests. |
-| `thread.turn(input).start().await?` | Get a `TurnHandle` for steering, interrupting, streaming, or collecting later. |
+| `thread.event_stream()?` | Take the thread's long-lived native event stream. |
+| `codex.request_typed::<T>(request).await?` | Send an arbitrary native `ClientRequest`. |
+| `thread.turn(input).start().await?` | Start a turn and get a handle for steering or interruption. |
+| `codex.turn(input).start().await?` | Start one turn on a temporary thread. Its handle exposes the owning thread. |
 | `codex.models().await?` | List visible Codex models. |
 | `codex.account().await?` | Read the current Codex account state. |
 
@@ -122,9 +152,10 @@ Turn input can be a string or `Vec<UserInput>`. Use
 `codex.turn_params(params)` or `thread.turn_params(params)` when you need full
 native `TurnStartParams` control.
 
-Interactive products should usually prefer `stream()` so the UI can respond to
-`ServerRequest` values. The collecting helper `send()` rejects unhandled server
-requests to fail closed.
+Thread events are always consumed as a stream so applications can process
+native status, error, output, and `ServerRequest` events across any number of
+turns without a second batch-result model. `TurnCompleted` marks one turn's
+completion; it does not end the thread stream.
 
 ## Configuration Model
 

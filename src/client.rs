@@ -20,7 +20,7 @@ use codex_utils_absolute_path::AbsolutePathBuf;
 use crate::error::{Error, Result};
 use crate::runtime::{DEFAULT_CHANNEL_CAPACITY, RuntimeHandle};
 use crate::thread::{Thread, ThreadBuilder};
-use crate::turn::{CodexTurnBuilder, IntoTurnInput, TurnBuilder, TurnResult};
+use crate::turn::{CodexTurnBuilder, IntoTurnInput};
 use crate::types::ClientInfo;
 use crate::warmup::WarmupBuilder;
 
@@ -31,14 +31,14 @@ use crate::warmup::WarmupBuilder;
 #[derive(Clone)]
 pub struct Codex {
     /// Shared runtime state and default options.
-    pub(crate) inner: Arc<CodexInner>,
+    inner: Arc<CodexInner>,
 }
 
-pub(crate) struct CodexInner {
+struct CodexInner {
     /// Codex app-server runtime connection.
-    pub(crate) runtime: Arc<RuntimeHandle>,
+    runtime: Arc<RuntimeHandle>,
     /// Native Codex defaults copied into new thread builders.
-    pub(crate) default_thread_params: ThreadStartParams,
+    default_thread_params: ThreadStartParams,
 }
 
 #[derive(Debug, Clone)]
@@ -101,14 +101,24 @@ impl Default for RuntimeOptions {
 }
 
 impl RuntimeOptions {
-    fn ensure_arg0_paths(&mut self) -> Arg0DispatchPaths {
-        self.arg0_paths
-            .get_or_insert_with(fallback_arg0_paths)
-            .clone()
+    fn take_arg0_paths(&mut self) -> Arg0DispatchPaths {
+        self.arg0_paths.take().unwrap_or_else(fallback_arg0_paths)
     }
 }
 
 impl Codex {
+    fn from_runtime(
+        runtime: Arc<RuntimeHandle>,
+        default_thread_params: ThreadStartParams,
+    ) -> Self {
+        Self {
+            inner: Arc::new(CodexInner {
+                runtime,
+                default_thread_params,
+            }),
+        }
+    }
+
     /// Start building a Codex runtime.
     pub fn builder() -> CodexBuilder {
         CodexBuilder::default()
@@ -148,13 +158,11 @@ impl Codex {
         &self,
         params: ModelListParams,
     ) -> Result<ModelListResponse> {
-        self.inner
-            .runtime
-            .request_typed(ClientRequest::ModelList {
-                request_id: self.inner.runtime.next_request_id(),
-                params,
-            })
-            .await
+        self.request_typed(ClientRequest::ModelList {
+            request_id: self.next_request_id(),
+            params,
+        })
+        .await
     }
 
     /// Read the current Codex account state without forcing a token refresh.
@@ -170,13 +178,11 @@ impl Codex {
         &self,
         params: GetAccountParams,
     ) -> Result<GetAccountResponse> {
-        self.inner
-            .runtime
-            .request_typed(ClientRequest::GetAccount {
-                request_id: self.inner.runtime.next_request_id(),
-                params,
-            })
-            .await
+        self.request_typed(ClientRequest::GetAccount {
+            request_id: self.next_request_id(),
+            params,
+        })
+        .await
     }
 
     /// Resume a saved Codex thread by id.
@@ -193,17 +199,16 @@ impl Codex {
         &self,
         params: ThreadResumeParams,
     ) -> Result<Thread> {
+        let event_rx = self.runtime().subscribe();
         let response: ThreadResumeResponse = self
-            .inner
-            .runtime
             .request_typed(ClientRequest::ThreadResume {
-                request_id: self.inner.runtime.next_request_id(),
+                request_id: self.next_request_id(),
                 params,
             })
             .await?;
         let thread_id = response.thread.id;
         tracing::info!(%thread_id, "resumed Codex thread");
-        Ok(Thread::from_id(self.clone(), thread_id))
+        Ok(Thread::from_id(self.clone(), thread_id, event_rx))
     }
 
     /// Fork a saved Codex thread by id.
@@ -224,17 +229,16 @@ impl Codex {
             params.thread_source = Some(ThreadSource::User);
         }
 
+        let event_rx = self.runtime().subscribe();
         let response: ThreadForkResponse = self
-            .inner
-            .runtime
             .request_typed(ClientRequest::ThreadFork {
-                request_id: self.inner.runtime.next_request_id(),
+                request_id: self.next_request_id(),
                 params,
             })
             .await?;
         let thread_id = response.thread.id;
         tracing::info!(%thread_id, "forked Codex thread");
-        Ok(Thread::from_id(self.clone(), thread_id))
+        Ok(Thread::from_id(self.clone(), thread_id, event_rx))
     }
 
     /// List saved Codex threads using server defaults.
@@ -247,13 +251,11 @@ impl Codex {
         &self,
         params: ThreadListParams,
     ) -> Result<ThreadListResponse> {
-        self.inner
-            .runtime
-            .request_typed(ClientRequest::ThreadList {
-                request_id: self.inner.runtime.next_request_id(),
-                params,
-            })
-            .await
+        self.request_typed(ClientRequest::ThreadList {
+            request_id: self.next_request_id(),
+            params,
+        })
+        .await
     }
 
     /// Archive a saved Codex thread.
@@ -261,24 +263,21 @@ impl Codex {
         &self,
         thread_id: impl Into<String>,
     ) -> Result<ThreadArchiveResponse> {
-        self.inner
-            .runtime
-            .request_typed(ClientRequest::ThreadArchive {
-                request_id: self.inner.runtime.next_request_id(),
-                params: ThreadArchiveParams {
-                    thread_id: thread_id.into(),
-                },
-            })
-            .await
+        self.request_typed(ClientRequest::ThreadArchive {
+            request_id: self.next_request_id(),
+            params: ThreadArchiveParams {
+                thread_id: thread_id.into(),
+            },
+        })
+        .await
     }
 
     /// Restore an archived Codex thread and return a reusable handle.
     pub async fn unarchive_thread(&self, thread_id: impl Into<String>) -> Result<Thread> {
+        let event_rx = self.runtime().subscribe();
         let response: ThreadUnarchiveResponse = self
-            .inner
-            .runtime
             .request_typed(ClientRequest::ThreadUnarchive {
-                request_id: self.inner.runtime.next_request_id(),
+                request_id: self.next_request_id(),
                 params: ThreadUnarchiveParams {
                     thread_id: thread_id.into(),
                 },
@@ -286,7 +285,7 @@ impl Codex {
             .await?;
         let thread_id = response.thread.id;
         tracing::info!(%thread_id, "unarchived Codex thread");
-        Ok(Thread::from_id(self.clone(), thread_id))
+        Ok(Thread::from_id(self.clone(), thread_id, event_rx))
     }
 
     /// Start building a turn in a temporary thread.
@@ -302,6 +301,25 @@ impl Codex {
     /// Warm app-server caches and inventories without creating a Codex thread.
     pub fn warmup(&self) -> WarmupBuilder {
         WarmupBuilder::new(self.clone())
+    }
+
+    /// Allocate a request id for a native [`ClientRequest`].
+    ///
+    /// Use this instead of choosing ids independently so low-level requests do
+    /// not collide with requests issued by the SDK's higher-level methods.
+    pub fn next_request_id(&self) -> RequestId {
+        self.inner.runtime.next_request_id()
+    }
+
+    /// Send a native Codex app-server request and deserialize its response.
+    ///
+    /// Construct the request with an id from [`next_request_id`](Self::next_request_id).
+    /// The expected response type depends on the `ClientRequest` variant.
+    pub async fn request_typed<T>(&self, request: ClientRequest) -> Result<T>
+    where
+        T: serde::de::DeserializeOwned,
+    {
+        self.inner.runtime.request_typed(request).await
     }
 
     /// Resolve a Codex server request with a method-specific result payload.
@@ -344,9 +362,20 @@ impl Codex {
             .await
     }
 
-    /// Shut down the Codex app-server runtime connection.
+    /// Shut down the Codex app-server runtime connection and await cleanup.
+    ///
+    /// Dropping the final SDK handle also signals shutdown, but this method is
+    /// preferred when the caller needs cleanup failures to be reported.
     pub async fn shutdown(&self) -> Result<()> {
         self.inner.runtime.shutdown().await
+    }
+
+    pub(crate) fn runtime(&self) -> &Arc<RuntimeHandle> {
+        &self.inner.runtime
+    }
+
+    pub(crate) fn default_thread_params(&self) -> &ThreadStartParams {
+        &self.inner.default_thread_params
     }
 }
 
@@ -571,7 +600,7 @@ impl CodexBuilder {
     /// Start the in-process Codex runtime.
     pub async fn start(self) -> Result<Codex> {
         let mut runtime = self.runtime;
-        let arg0_paths = runtime.ensure_arg0_paths();
+        let arg0_paths = runtime.take_arg0_paths();
         let cwd = match self.cwd {
             Some(cwd) => cwd,
             None => std::env::current_dir()?,
@@ -597,7 +626,7 @@ impl CodexBuilder {
         )
         .await?;
 
-        start_with_config(config, runtime).await
+        start_with_config_and_paths(config, runtime, arg0_paths).await
     }
 }
 
@@ -778,32 +807,30 @@ impl CodexRemoteBuilder {
         })
         .await?;
 
-        Ok(Codex {
-            inner: Arc::new(CodexInner {
-                runtime,
-                default_thread_params: self.default_thread_params,
-            }),
-        })
+        Ok(Codex::from_runtime(runtime, self.default_thread_params))
     }
 }
 
 async fn start_with_config(config: Config, mut runtime: RuntimeOptions) -> Result<Codex> {
-    let default_thread_params = default_thread_params_from_config(&config);
-    let arg0_paths = runtime.ensure_arg0_paths();
-    let runtime = RuntimeHandle::start(
-        arg0_paths,
-        config,
-        runtime.client_info,
-        runtime.channel_capacity,
-    )
-    .await?;
+    let arg0_paths = runtime.take_arg0_paths();
+    start_with_config_and_paths(config, runtime, arg0_paths).await
+}
 
-    Ok(Codex {
-        inner: Arc::new(CodexInner {
-            runtime,
-            default_thread_params,
-        }),
-    })
+async fn start_with_config_and_paths(
+    config: Config,
+    runtime: RuntimeOptions,
+    arg0_paths: Arg0DispatchPaths,
+) -> Result<Codex> {
+    let default_thread_params = default_thread_params_from_config(&config);
+    let RuntimeOptions {
+        client_info,
+        channel_capacity,
+        ..
+    } = runtime;
+    let runtime =
+        RuntimeHandle::start(arg0_paths, config, client_info, channel_capacity).await?;
+
+    Ok(Codex::from_runtime(runtime, default_thread_params))
 }
 
 fn remote_default_thread_params() -> ThreadStartParams {
@@ -942,20 +969,5 @@ impl IntoFuture for CodexRemoteBuilder {
 
     fn into_future(self) -> Self::IntoFuture {
         Box::pin(async move { self.start().await })
-    }
-}
-
-impl CodexTurnBuilder {
-    pub(crate) async fn start_ephemeral_thread(self) -> Result<TurnResult> {
-        let thread = self
-            .codex
-            .thread()
-            .params(self.thread_params)
-            .start()
-            .await?;
-        TurnBuilder::from_params(thread, self.turn_params)
-            .maybe_timeout(self.timeout)
-            .send()
-            .await
     }
 }

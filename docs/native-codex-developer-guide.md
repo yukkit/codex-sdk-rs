@@ -373,7 +373,10 @@ Startup flow, roughly:
    inside the runtime.
 7. Start app-server with
    `InProcessAppServerClient::start(InProcessClientStartArgs { ... })`.
-8. Drive later work through typed `ClientRequest::ThreadStart` and
+8. Move the full `AppServerClient` into `AppServerDriver`, which exclusively
+   owns event polling and shutdown. `RuntimeHandle` uses `AppServerHandle` for
+   typed requests and server-request responses without sharing the event source.
+9. Drive later work through typed `ClientRequest::ThreadStart` and
    `ClientRequest::TurnStart`.
 
 Remote mode does not use local `ConfigBuilder` / `InProcessClientStartArgs`.
@@ -459,13 +462,13 @@ the turn may hang.
 Design principles:
 
 - Streaming APIs should expose `ServerRequest` to callers.
-- If a synchronous collect API has no interactive channel, it should fail
-  closed; the current SDK automatically rejects.
+- The SDK does not provide a synchronous collector; applications retain control
+  of request handling while consuming the native event stream.
 - The response shape must match the request type, such as approval decisions or
   MCP elicitation action/content.
 - Request ids must come from the current client event stream.
 - Events only carry native Codex request data; resolve/reject behavior that owns
-  the runtime belongs on `Codex` or `TurnStream` methods.
+  the runtime belongs on `Codex` or `ThreadEventStream` methods.
 - Most requests should be routed precisely by thread/turn. Global requests that
   lack thread/turn ids may be seen by multiple active streams; applications
   should handle them idempotently by `RequestId`.
@@ -477,20 +480,24 @@ manage multiple threads. Running multiple turns on the same thread at the same
 time makes context ordering, server request ownership, and token usage more
 complex.
 
-`codex-sdk-rs` serializes active turns within the same `Thread` by default with
-`Semaphore(1)`:
+`codex-sdk-rs` deliberately does not keep an active-turn registry or serialize
+turns for callers:
 
-- Different `Thread`s can run concurrently.
-- A second `turn.stream().await` on the same `Thread` waits until the previous
-  `TurnStream` is dropped or completes.
+- Different thread IDs can run concurrently.
+- Applications must not start overlapping turns for the same thread ID unless
+  they explicitly accept the app-server's behavior.
+- Dropping a local `ThreadEventStream` does not interrupt an active server turn.
+  It also permanently gives up local event consumption for that `Thread`
+  handle, because the stream is unique across all of its clones.
 
-This is the SDK's default safe abstraction and keeps application code away from
-app-server event ownership pitfalls.
+This keeps the runtime free of duplicate turn-lifecycle state. Serialization is
+an application-level contract, including across independently resumed `Thread`
+handles for the same ID.
 
 ## Event Dispatch Boundary
 
-Turn streams expose the native `codex_app_server_client::AppServerEvent`
-directly:
+Each thread exposes one long-lived
+`codex_app_server_client::AppServerEvent` stream directly:
 
 - `AppServerEvent::ServerNotification(codex_app_server_protocol::ServerNotification)`
 - `AppServerEvent::ServerRequest(codex_app_server_protocol::ServerRequest)`
@@ -503,12 +510,13 @@ fields. When upgrading the Codex tag, a compile failure from a new
 `ServerRequest` / `ServerNotification` variant is a useful signal: decide
 explicitly whether it is turn-scoped, thread-scoped, or global.
 
-Dispatch from the runtime to `TurnStream` currently uses a Tokio broadcast
-channel. Slow consumers receive `Lagged { skipped }`; this means the stream may
-have missed deltas, requests, or `TurnCompleted`. Synchronous `send()`
-aggregation still relies on receiving `TurnCompleted`, which is a reliability
-boundary that needs a dedicated design later and should not be refactored
-casually during a normal protocol upgrade.
+Dispatch from the runtime to `ThreadEventStream` currently uses a Tokio
+broadcast channel. A receiver is created before thread start/resume/fork or
+unarchive, then retained by `Thread` until the application takes it. Slow
+consumers receive `Lagged { skipped }`; this means the stream may have missed
+deltas, requests, or `TurnCompleted`. `TurnCompleted` is a turn boundary, not a
+stream boundary. `ThreadClosed` and runtime disconnection are stream terminal
+events.
 
 ## Dependency Audit Boundary
 
@@ -536,9 +544,10 @@ it.
   fields can also have convenience setters.
 - The event layer should expose native `ServerNotification` and
   `ServerRequest` directly; runtime-backed response behavior belongs on
-  `Codex` / `TurnStream`.
-- Event subscription should happen before `turn/start` to avoid missing very
-  fast events.
+  `Codex` / `ThreadEventStream`.
+- Event subscription should happen before the thread lifecycle request that
+  creates its handle, so fast initial events are buffered before the handle is
+  returned.
 - Shutdown should close the runtime and give long-lived connections or
   background tasks a clear shutdown path.
 - When updating the Codex git tag, run the

@@ -106,7 +106,8 @@ pub struct WarmupFailure {
 ///
 /// Create one with [`Codex::warmup`](crate::Codex::warmup). The default builder
 /// warms the model catalog, skills, permission profiles, managed config
-/// requirements, account lookup, MCP server status, and app/connector listing.
+/// requirements, account lookup, and MCP server status. App/connector listing
+/// can be enabled with [`apps`](Self::apps).
 ///
 /// # Examples
 ///
@@ -148,7 +149,8 @@ impl WarmupBuilder {
     /// and permission-profile warmup the closest cache match that the public
     /// app-server protocol currently supports.
     pub fn cwd(mut self, cwd: impl Into<PathBuf>) -> Self {
-        self.targets.thread_params.cwd = Some(cwd_to_string(cwd));
+        let cwd = cwd.into();
+        self.targets.thread_params.cwd = Some(cwd_to_string(&cwd));
         self
     }
 
@@ -221,39 +223,36 @@ impl WarmupBuilder {
     /// Requests are executed sequentially to keep app-server startup behavior
     /// predictable. Individual request failures are captured in
     /// [`WarmupResult::failures`] and do not stop later warmup steps.
-    pub async fn send(self) -> Result<WarmupResult> {
+    pub async fn send(mut self) -> Result<WarmupResult> {
+        let cwd = self.take_effective_cwd();
         let span = tracing::info_span!(
             "codex_sdk.warmup",
-            cwd = self
-                .effective_cwd()
+            cwd = cwd
                 .as_ref()
                 .map(|cwd| cwd.display().to_string())
                 .unwrap_or_else(|| "-".to_string()),
         );
-        Ok(self.send_inner().instrument(span).await)
+        Ok(self.send_inner(cwd).instrument(span).await)
     }
 
-    fn effective_cwd(&self) -> Option<PathBuf> {
+    fn take_effective_cwd(&mut self) -> Option<PathBuf> {
         self.targets
             .thread_params
             .cwd
-            .clone()
-            .or_else(|| self.codex.inner.default_thread_params.cwd.clone())
+            .take()
+            .or_else(|| self.codex.default_thread_params().cwd.clone())
             .map(PathBuf::from)
     }
 
-    async fn send_inner(self) -> WarmupResult {
-        let cwd = self.effective_cwd();
-        let cwd_string = cwd.as_ref().map(|cwd| cwd.to_string_lossy().to_string());
+    async fn send_inner(self, cwd: Option<PathBuf>) -> WarmupResult {
+        let cwd_string = cwd.as_ref().map(cwd_to_string);
         let mut result = WarmupResult::default();
 
         if self.targets.models {
             match self
                 .codex
-                .inner
-                .runtime
                 .request_typed::<ModelListResponse>(ClientRequest::ModelList {
-                    request_id: self.codex.inner.runtime.next_request_id(),
+                    request_id: self.codex.next_request_id(),
                     params: ModelListParams {
                         include_hidden: Some(true),
                         ..Default::default()
@@ -269,12 +268,10 @@ impl WarmupBuilder {
         if self.targets.skills {
             match self
                 .codex
-                .inner
-                .runtime
                 .request_typed::<SkillsListResponse>(ClientRequest::SkillsList {
-                    request_id: self.codex.inner.runtime.next_request_id(),
+                    request_id: self.codex.next_request_id(),
                     params: SkillsListParams {
-                        cwds: cwd.clone().into_iter().collect(),
+                        cwds: cwd.into_iter().collect(),
                         force_reload: self.targets.force_reload_skills,
                     },
                 })
@@ -291,11 +288,9 @@ impl WarmupBuilder {
         if self.targets.permission_profiles {
             match self
                 .codex
-                .inner
-                .runtime
                 .request_typed::<PermissionProfileListResponse>(
                     ClientRequest::PermissionProfileList {
-                        request_id: self.codex.inner.runtime.next_request_id(),
+                        request_id: self.codex.next_request_id(),
                         params: PermissionProfileListParams {
                             cursor: None,
                             limit: None,
@@ -313,11 +308,9 @@ impl WarmupBuilder {
         if self.targets.config_requirements {
             match self
                 .codex
-                .inner
-                .runtime
                 .request_typed::<ConfigRequirementsReadResponse>(
                     ClientRequest::ConfigRequirementsRead {
-                        request_id: self.codex.inner.runtime.next_request_id(),
+                        request_id: self.codex.next_request_id(),
                         params: None,
                     },
                 )
@@ -333,10 +326,8 @@ impl WarmupBuilder {
         if self.targets.account {
             match self
                 .codex
-                .inner
-                .runtime
                 .request_typed::<GetAccountResponse>(ClientRequest::GetAccount {
-                    request_id: self.codex.inner.runtime.next_request_id(),
+                    request_id: self.codex.next_request_id(),
                     params: GetAccountParams {
                         refresh_token: false,
                     },
@@ -351,11 +342,9 @@ impl WarmupBuilder {
         if self.targets.mcp_status {
             match self
                 .codex
-                .inner
-                .runtime
                 .request_typed::<ListMcpServerStatusResponse>(
                     ClientRequest::McpServerStatusList {
-                        request_id: self.codex.inner.runtime.next_request_id(),
+                        request_id: self.codex.next_request_id(),
                         params: ListMcpServerStatusParams {
                             cursor: None,
                             limit: None,
@@ -374,10 +363,8 @@ impl WarmupBuilder {
         if self.targets.apps {
             match self
                 .codex
-                .inner
-                .runtime
                 .request_typed::<AppsListResponse>(ClientRequest::AppsList {
-                    request_id: self.codex.inner.runtime.next_request_id(),
+                    request_id: self.codex.next_request_id(),
                     params: AppsListParams {
                         cursor: None,
                         limit: None,

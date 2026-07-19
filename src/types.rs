@@ -1,4 +1,4 @@
-use std::path::PathBuf;
+use std::path::Path;
 
 /// Identifier assigned by the Codex app-server to a conversation thread.
 pub type ThreadId = String;
@@ -24,6 +24,6 @@ impl Default for ClientInfo {
     }
 }
 
-pub(crate) fn cwd_to_string(cwd: impl Into<PathBuf>) -> String {
-    cwd.into().to_string_lossy().to_string()
+pub(crate) fn cwd_to_string(cwd: impl AsRef<Path>) -> String {
+    cwd.as_ref().to_string_lossy().into_owned()
 }
