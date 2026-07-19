@@ -1,4 +1,5 @@
 use std::collections::{BTreeMap, HashMap};
+use std::fmt;
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicBool, Ordering};
 
@@ -76,7 +77,7 @@ impl Drop for ObservabilityGuard {
 ///
 /// The builder wraps Codex's [`OtelSettings`] with common SDK defaults and can
 /// optionally install a global `tracing_subscriber`.
-#[derive(Clone, Debug)]
+#[derive(Clone)]
 pub struct ObservabilityBuilder {
     /// Codex OpenTelemetry settings passed to `OtelProvider`.
     settings: OtelSettings,
@@ -86,6 +87,32 @@ pub struct ObservabilityBuilder {
     install_subscriber: bool,
     /// Whether to include a human-readable formatting layer.
     fmt_layer: bool,
+}
+
+impl fmt::Debug for ObservabilityBuilder {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        formatter
+            .debug_struct("ObservabilityBuilder")
+            .field("environment", &self.settings.environment)
+            .field("service_name", &self.settings.service_name)
+            .field("service_version", &self.settings.service_version)
+            .field("logs_exporter", &exporter_kind(&self.settings.exporter))
+            .field(
+                "traces_exporter",
+                &exporter_kind(&self.settings.trace_exporter),
+            )
+            .field(
+                "metrics_exporter",
+                &exporter_kind(&self.settings.metrics_exporter),
+            )
+            .field("runtime_metrics", &self.settings.runtime_metrics)
+            .field("span_attribute_count", &self.settings.span_attributes.len())
+            .field("tracestate_count", &self.settings.tracestate.len())
+            .field("env_filter", &self.env_filter)
+            .field("install_subscriber", &self.install_subscriber)
+            .field("fmt_layer", &self.fmt_layer)
+            .finish()
+    }
 }
 
 impl Default for ObservabilityBuilder {
@@ -413,6 +440,15 @@ fn exporter_from_env(signal: Signal) -> Result<OtelExporter> {
     }
 }
 
+fn exporter_kind(exporter: &OtelExporter) -> &'static str {
+    match exporter {
+        OtelExporter::None => "none",
+        OtelExporter::Statsig => "statsig",
+        OtelExporter::OtlpGrpc { .. } => "otlp_grpc",
+        OtelExporter::OtlpHttp { .. } => "otlp_http",
+    }
+}
+
 fn merged_headers(signal: Signal) -> Result<HashMap<String, String>> {
     let mut headers = HashMap::new();
     for key in ["OTEL_EXPORTER_OTLP_HEADERS", signal.headers_key()] {
@@ -508,5 +544,23 @@ mod tests {
     #[test]
     fn key_value_list_rejects_malformed_entries() {
         assert!(parse_key_value_list("valid=one,invalid").is_err());
+    }
+
+    #[test]
+    fn builder_debug_redacts_exporter_endpoints_and_headers() {
+        let builder = Observability::builder().logs_exporter(OtelExporter::OtlpHttp {
+            endpoint: "https://collector.test/path-secret".to_string(),
+            headers: HashMap::from([(
+                "authorization".to_string(),
+                "header-secret".to_string(),
+            )]),
+            protocol: OtelHttpProtocol::Binary,
+            tls: None,
+        });
+
+        let debug = format!("{builder:?}");
+        assert!(debug.contains("otlp_http"));
+        assert!(!debug.contains("path-secret"));
+        assert!(!debug.contains("header-secret"));
     }
 }

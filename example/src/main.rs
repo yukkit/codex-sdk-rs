@@ -1,3 +1,5 @@
+//! Minimal in-process Codex SDK example.
+
 use codex_sdk::prelude::*;
 use tokio_stream::StreamExt;
 

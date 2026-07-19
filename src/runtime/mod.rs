@@ -1,4 +1,6 @@
 mod app_server;
+mod events;
+mod mailbox;
 
 use std::sync::Arc;
 
@@ -16,7 +18,9 @@ use codex_arg0::Arg0DispatchPaths;
 use codex_core::config::Config;
 use codex_feedback::CodexFeedback;
 use codex_protocol::protocol::SessionSource;
-use tokio::sync::{Mutex, broadcast, oneshot};
+use events::EventRouter;
+pub(crate) use events::{EventReceiver, ThreadAttachmentKind, ThreadEventReservation};
+use tokio::sync::{Mutex, oneshot};
 use tokio::task::JoinHandle;
 use tracing::warn;
 
@@ -26,8 +30,8 @@ use crate::types::ClientInfo;
 pub(crate) struct RuntimeHandle {
     /// Unified handle for requests and server-request responses.
     app_server: AppServerHandle,
-    /// Shared event distribution channel.
-    event_tx: broadcast::Sender<AppServerEvent>,
+    /// Routes app-server events to their single owning stream.
+    events: Arc<EventRouter>,
     /// Serialized, cancellation-safe ownership of runtime shutdown.
     shutdown: Mutex<RuntimeShutdown>,
 }
@@ -35,6 +39,7 @@ pub(crate) struct RuntimeHandle {
 struct RuntimeShutdown {
     signal: Option<oneshot::Sender<()>>,
     task: Option<JoinHandle<Result<()>>>,
+    failure: Option<String>,
 }
 
 impl RuntimeHandle {
@@ -42,9 +47,11 @@ impl RuntimeHandle {
         arg0_paths: Arg0DispatchPaths,
         config: Config,
         client_info: ClientInfo,
-        channel_capacity: usize,
+        app_server_channel_capacity: usize,
+        event_stream_capacity: usize,
     ) -> Result<Arc<Self>> {
-        let channel_capacity = channel_capacity.max(1);
+        let app_server_channel_capacity = app_server_channel_capacity.max(1);
+        let event_stream_capacity = event_stream_capacity.max(1);
         tracing::info!(
             client_name = %client_info.name,
             cwd = %config.cwd.display(),
@@ -72,7 +79,7 @@ impl RuntimeHandle {
             environment_manager,
             config_warnings,
             client_info,
-            channel_capacity,
+            app_server_channel_capacity,
         );
 
         let client = InProcessAppServerClient::start(start_args)
@@ -80,36 +87,41 @@ impl RuntimeHandle {
             .map_err(Error::runtime_start)?;
         let client = AppServerClient::InProcess(client);
 
-        Ok(Self::start_with_client(client, channel_capacity))
+        Ok(Self::start_with_client(client, event_stream_capacity))
     }
 
     pub(crate) async fn connect_remote(
         mut args: RemoteAppServerConnectArgs,
+        event_stream_capacity: usize,
     ) -> Result<Arc<Self>> {
         tracing::info!("connecting to remote Codex app-server runtime");
 
         args.channel_capacity = args.channel_capacity.max(1);
-        let channel_capacity = args.channel_capacity;
         let client = RemoteAppServerClient::connect(args)
             .await
             .map_err(Error::runtime_start)?;
         let client = AppServerClient::Remote(client);
 
-        Ok(Self::start_with_client(client, channel_capacity))
+        Ok(Self::start_with_client(
+            client,
+            event_stream_capacity.max(1),
+        ))
     }
 
-    fn start_with_client(client: AppServerClient, channel_capacity: usize) -> Arc<Self> {
-        debug_assert!(channel_capacity > 0);
-        let (event_tx, _) = broadcast::channel(channel_capacity);
-        let (app_server_driver, app_server) =
-            AppServerDriver::new(client, channel_capacity);
+    fn start_with_client(
+        client: AppServerClient,
+        event_stream_capacity: usize,
+    ) -> Arc<Self> {
+        debug_assert!(event_stream_capacity > 0);
+        let events = EventRouter::new(event_stream_capacity);
+        let (app_server_driver, app_server) = AppServerDriver::new(client);
         let (shutdown_tx, shutdown_rx) = oneshot::channel();
         let task_handle =
-            spawn_event_loop(app_server_driver, event_tx.clone(), shutdown_rx);
+            spawn_event_loop(app_server_driver, Arc::clone(&events), shutdown_rx);
 
         Arc::new(Self {
             app_server,
-            event_tx,
+            events,
             shutdown: Mutex::new(RuntimeShutdown::new(shutdown_tx, task_handle)),
         })
     }
@@ -125,8 +137,24 @@ impl RuntimeHandle {
         self.app_server.request_typed(request).await
     }
 
-    pub(crate) fn subscribe(&self) -> broadcast::Receiver<AppServerEvent> {
-        self.event_tx.subscribe()
+    pub(crate) fn prepare_thread_events(
+        &self,
+        thread_id: &str,
+        kind: ThreadAttachmentKind,
+    ) -> Result<ThreadEventReservation> {
+        self.events.prepare_thread(thread_id, kind)
+    }
+
+    pub(crate) fn take_thread_events(&self, thread_id: &str) -> Result<EventReceiver> {
+        self.events.take_thread(thread_id)
+    }
+
+    pub(crate) fn complete_thread_archive(&self, thread_id: &str) -> Result<()> {
+        self.events.complete_archive(thread_id)
+    }
+
+    pub(crate) fn take_runtime_events(&self) -> Result<EventReceiver> {
+        self.events.take_runtime()
     }
 
     pub(crate) async fn resolve_server_request(
@@ -161,6 +189,7 @@ impl RuntimeShutdown {
         Self {
             signal: Some(signal),
             task: Some(task),
+            failure: None,
         }
     }
 
@@ -171,12 +200,24 @@ impl RuntimeShutdown {
 
         let result = match self.task.as_mut() {
             Some(task) => task.await,
-            None => return Ok(()),
+            None => {
+                return match &self.failure {
+                    Some(message) => Err(Error::RuntimeShutdownFailed {
+                        message: message.clone(),
+                    }),
+                    None => Ok(()),
+                };
+            }
         };
         self.task.take();
 
-        result.map_err(Error::runtime_task)??;
-        Ok(())
+        let result = result
+            .map_err(Error::runtime_task)
+            .and_then(|result| result);
+        if let Err(error) = &result {
+            self.failure = Some(error.to_string());
+        }
+        result
     }
 }
 
@@ -192,7 +233,7 @@ fn sdk_in_process_client_start_args(
     environment_manager: EnvironmentManager,
     config_warnings: Vec<ConfigWarningNotification>,
     client_info: ClientInfo,
-    channel_capacity: usize,
+    app_server_channel_capacity: usize,
 ) -> InProcessClientStartArgs {
     let client_name = client_info.name;
     InProcessClientStartArgs {
@@ -214,7 +255,7 @@ fn sdk_in_process_client_start_args(
         experimental_api: true,
         mcp_server_openai_form_elicitation: false,
         opt_out_notification_methods: Vec::new(),
-        channel_capacity,
+        channel_capacity: app_server_channel_capacity,
     }
 }
 
@@ -233,7 +274,7 @@ fn config_warnings(config: &Config) -> Vec<ConfigWarningNotification> {
 
 fn spawn_event_loop(
     mut app_server: AppServerDriver,
-    event_tx: broadcast::Sender<AppServerEvent>,
+    events: Arc<EventRouter>,
     mut shutdown_rx: oneshot::Receiver<()>,
 ) -> JoinHandle<Result<()>> {
     tokio::spawn(async move {
@@ -241,14 +282,14 @@ fn spawn_event_loop(
             tokio::select! {
                 biased;
                 _ = &mut shutdown_rx => {
-                    let _ = event_tx.send(AppServerEvent::Disconnected {
+                    events.close(AppServerEvent::Disconnected {
                         message: "Codex app-server runtime shut down".to_string(),
                     });
                     break;
                 }
                 event = app_server.next_event() => {
                     let Some(event) = event else {
-                        let _ = event_tx.send(AppServerEvent::Disconnected {
+                        events.close(AppServerEvent::Disconnected {
                             message: "Codex app-server event stream closed".to_string(),
                         });
                         break;
@@ -256,8 +297,17 @@ fn spawn_event_loop(
                     if let AppServerEvent::Disconnected { message } = &event {
                         warn!(%message, "Codex app-server disconnected");
                     }
-                    let disconnected = matches!(event, AppServerEvent::Disconnected { .. });
-                    let _ = event_tx.send(event);
+                    let disconnected = matches!(&event, AppServerEvent::Disconnected { .. });
+                    tokio::select! {
+                        biased;
+                        _ = &mut shutdown_rx => {
+                            events.close(AppServerEvent::Disconnected {
+                                message: "Codex app-server runtime shut down".to_string(),
+                            });
+                            break;
+                        }
+                        _ = events.route(event) => {}
+                    }
                     if disconnected {
                         break;
                     }
@@ -321,5 +371,21 @@ mod tests {
             .shutdown()
             .await
             .expect("shutdown should be idempotent");
+    }
+
+    #[tokio::test]
+    async fn shutdown_failure_remains_visible_to_later_callers() {
+        let (shutdown_tx, _shutdown_rx) = oneshot::channel();
+        let task = tokio::spawn(async { Err(Error::RuntimeClosed) });
+        let mut shutdown = RuntimeShutdown::new(shutdown_tx, task);
+
+        assert!(matches!(
+            shutdown.shutdown().await,
+            Err(Error::RuntimeClosed)
+        ));
+        assert!(matches!(
+            shutdown.shutdown().await,
+            Err(Error::RuntimeShutdownFailed { .. })
+        ));
     }
 }

@@ -20,7 +20,7 @@ edition = "2024"
 readme = "README.md"
 repository = "https://github.com/yukkit/<repo>"
 license = "Apache-2.0"
-rust-version = "1.85.0"
+rust-version = "1.95.0"
 version = "0.1.0"
 
 [workspace.dependencies]
@@ -31,7 +31,7 @@ serde = { version = "1", features = ["derive"] }
 serde_json = "1"
 thiserror = "2"
 tokio = { version = "1", features = ["macros", "rt-multi-thread", "sync", "time"] }
-tokio-stream = { version = "0.1", features = ["sync"] }
+tokio-stream = "0.1"
 tracing = "0.1"
 tracing-subscriber = { version = "0.3", features = ["env-filter", "fmt"] }
 dotenvy = "0.15"

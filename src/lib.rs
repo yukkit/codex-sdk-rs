@@ -11,7 +11,9 @@ mod turn;
 mod types;
 mod warmup;
 
-pub use client::{Codex, CodexBuilder, CodexRemoteBuilder, CodexWithConfigBuilder};
+pub use client::{
+    Codex, CodexBuilder, CodexEventStream, CodexRemoteBuilder, CodexWithConfigBuilder,
+};
 pub use codex_app_server_client::AppServerEvent;
 pub use codex_app_server_protocol::{
     Account, AskForApproval, ClientRequest, GetAccountParams, GetAccountResponse, Model,
@@ -43,13 +45,14 @@ pub use warmup::{WarmupBuilder, WarmupFailure, WarmupResult};
 pub mod prelude {
     pub use crate::{
         Account, AppServerEvent, AskForApproval, ClientRequest, Codex, CodexBuilder,
-        CodexMain, CodexRemoteBuilder, CodexTurnBuilder, CodexWithConfigBuilder, Config,
-        Error, GetAccountParams, IntoTurnInput, Model, ModelListParams, Observability,
-        ObservabilityBuilder, ObservabilityGuard, OtelExporter, OtelHttpProtocol,
-        OtelSettings, Personality, ReasoningEffort, ReasoningSummary, RequestId, Result,
-        SandboxMode, SandboxPolicy, ServerNotification, ServerRequest, Thread,
-        ThreadBuilder, ThreadEventStream, ThreadForkParams, ThreadListParams,
-        ThreadResumeParams, ThreadStartParams, TurnBuilder, TurnHandle, TurnStartParams,
-        UserInput, WarmupBuilder, WarmupFailure, WarmupResult, run_main,
+        CodexEventStream, CodexMain, CodexRemoteBuilder, CodexTurnBuilder,
+        CodexWithConfigBuilder, Config, Error, GetAccountParams, IntoTurnInput, Model,
+        ModelListParams, Observability, ObservabilityBuilder, ObservabilityGuard,
+        OtelExporter, OtelHttpProtocol, OtelSettings, Personality, ReasoningEffort,
+        ReasoningSummary, RequestId, Result, SandboxMode, SandboxPolicy,
+        ServerNotification, ServerRequest, Thread, ThreadBuilder, ThreadEventStream,
+        ThreadForkParams, ThreadListParams, ThreadResumeParams, ThreadStartParams,
+        TurnBuilder, TurnHandle, TurnStartParams, UserInput, WarmupBuilder,
+        WarmupFailure, WarmupResult, run_main,
     };
 }

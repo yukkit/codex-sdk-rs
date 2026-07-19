@@ -1,24 +1,21 @@
+use std::fmt;
 use std::pin::Pin;
 use std::sync::{Arc, Mutex, PoisonError};
-use std::task::{Context, Poll, ready};
+use std::task::{Context, Poll};
 
 use codex_app_server_client::AppServerEvent;
 use codex_app_server_protocol::{
-    AskForApproval, ClientRequest, RequestId, SandboxMode, ServerNotification,
-    ThreadArchiveResponse, ThreadCompactStartParams, ThreadCompactStartResponse,
-    ThreadForkParams, ThreadReadParams, ThreadReadResponse, ThreadSetNameParams,
-    ThreadSetNameResponse, ThreadSource, ThreadStartParams, ThreadStartResponse,
-    TurnStartParams,
+    AskForApproval, ClientRequest, RequestId, SandboxMode, ThreadArchiveResponse,
+    ThreadCompactStartParams, ThreadCompactStartResponse, ThreadForkParams,
+    ThreadReadParams, ThreadReadResponse, ThreadSetNameParams, ThreadSetNameResponse,
+    ThreadSource, ThreadStartParams, ThreadStartResponse, TurnStartParams,
 };
 use codex_protocol::config_types::Personality;
-use tokio::sync::broadcast;
 use tokio_stream::Stream;
-use tokio_stream::wrappers::BroadcastStream;
-use tokio_stream::wrappers::errors::BroadcastStreamRecvError;
 
 use crate::client::Codex;
 use crate::error::{Error, Result};
-use crate::event::event_matches;
+use crate::runtime::EventReceiver;
 use crate::turn::{IntoTurnInput, TurnBuilder};
 use crate::types::{ThreadId, cwd_to_string};
 
@@ -32,21 +29,26 @@ pub struct Thread {
     inner: Arc<ThreadInner>,
 }
 
+impl fmt::Debug for Thread {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        formatter
+            .debug_struct("Thread")
+            .field("id", &self.inner.id)
+            .finish_non_exhaustive()
+    }
+}
+
 struct ThreadInner {
     /// Shared Codex runtime that owns this thread.
     codex: Codex,
     /// Codex-assigned thread id.
     id: ThreadId,
     /// The thread's receiver is unique even when its control handle is cloned.
-    event_rx: Mutex<Option<broadcast::Receiver<AppServerEvent>>>,
+    event_rx: Mutex<Option<EventReceiver>>,
 }
 
 impl Thread {
-    pub(crate) fn from_id(
-        codex: Codex,
-        id: ThreadId,
-        event_rx: broadcast::Receiver<AppServerEvent>,
-    ) -> Self {
+    pub(crate) fn from_id(codex: Codex, id: ThreadId, event_rx: EventReceiver) -> Self {
         Self {
             inner: Arc::new(ThreadInner {
                 codex,
@@ -65,7 +67,13 @@ impl Thread {
     ///
     /// The stream contains every event associated with this thread across all
     /// of its turns. `TurnCompleted` is an ordinary event and does not end the
-    /// stream. The stream ends when the thread or runtime closes.
+    /// stream. A successful SDK archive delivers `ThreadArchived` as the final
+    /// event. Observed `ThreadDeleted` and `ThreadClosed` notifications are also
+    /// terminal; runtime disconnection is delivered before the stream ends.
+    ///
+    /// Poll the stream continuously while the thread is active. A full queue
+    /// of reliable transcript, completion, or server-request events applies
+    /// backpressure to the shared runtime and can delay unrelated threads.
     ///
     /// A thread has exactly one event stream, shared across all clones of its
     /// handle. Calling this method more than once returns
@@ -84,17 +92,20 @@ impl Thread {
 
         Ok(ThreadEventStream {
             thread: self.clone(),
-            event_rx: BroadcastStream::new(event_rx),
-            terminated: false,
+            event_rx,
         })
     }
 
     /// Start building a turn from user input.
+    ///
+    /// Do not start it while another turn for this thread ID is active.
     pub fn turn(&self, input: impl IntoTurnInput) -> TurnBuilder {
         TurnBuilder::new(self.clone(), input)
     }
 
     /// Start building a turn from native Codex `turn/start` params.
+    ///
+    /// Do not start it while another turn for this thread ID is active.
     pub fn turn_params(&self, params: TurnStartParams) -> TurnBuilder {
         TurnBuilder::from_params(self.clone(), params)
     }
@@ -154,7 +165,12 @@ impl Thread {
         self.inner.codex.fork_thread_params(params).await
     }
 
-    /// Archive this thread.
+    /// Archive this thread in persistent Codex state.
+    ///
+    /// A successful response establishes the local stream boundary before this
+    /// method returns. `ThreadArchived` is delivered as the final event on this
+    /// handle's stream, and [`Codex::unarchive_thread`](crate::Codex::unarchive_thread)
+    /// creates a new attachment with a new event stream.
     pub async fn archive(&self) -> Result<ThreadArchiveResponse> {
         self.inner.codex.archive_thread(self.inner.id.clone()).await
     }
@@ -166,16 +182,15 @@ impl Thread {
 
 /// Long-lived stream of events for one [`Thread`].
 ///
-/// This stream spans turns and yields thread-scoped requests and notifications,
-/// plus runtime-level lag and disconnection events. Dropping it stops local
-/// event consumption but does not interrupt an active turn.
+/// This stream spans turns and yields only requests and notifications owned by
+/// this thread. Runtime disconnection is also delivered before the stream ends.
+/// Dropping it stops local event consumption but does not interrupt an active
+/// turn.
 pub struct ThreadEventStream {
     /// Owning thread, retained for its id, control API, and runtime lifetime.
     thread: Thread,
-    /// Subscription created before the thread request, so early events survive.
-    event_rx: BroadcastStream<AppServerEvent>,
-    /// Set after the thread/runtime closes or the source channel ends.
-    terminated: bool,
+    /// Dedicated receiver populated by the runtime's thread-aware event router.
+    event_rx: EventReceiver,
 }
 
 impl ThreadEventStream {
@@ -184,7 +199,7 @@ impl ThreadEventStream {
         &self.thread
     }
 
-    /// Thread id this stream is filtered to.
+    /// Thread id this stream belongs to.
     pub fn thread_id(&self) -> &str {
         self.thread.id()
     }
@@ -217,50 +232,17 @@ impl ThreadEventStream {
             .reject_server_request(request_id, message)
             .await
     }
-
-    fn poll_next_event(&mut self, cx: &mut Context<'_>) -> Poll<Option<AppServerEvent>> {
-        if self.terminated {
-            return Poll::Ready(None);
-        }
-
-        loop {
-            let event = match ready!(Pin::new(&mut self.event_rx).poll_next(cx)) {
-                Some(Ok(event)) => event,
-                Some(Err(BroadcastStreamRecvError::Lagged(skipped))) => {
-                    return Poll::Ready(Some(AppServerEvent::Lagged {
-                        skipped: skipped.try_into().unwrap_or(usize::MAX),
-                    }));
-                }
-                None => {
-                    self.terminated = true;
-                    return Poll::Ready(None);
-                }
-            };
-
-            if event_matches(&event, self.thread.id()) {
-                if is_terminal_thread_event(&event) {
-                    self.terminated = true;
-                }
-                return Poll::Ready(Some(event));
-            }
-        }
-    }
 }
 
 impl Stream for ThreadEventStream {
     type Item = AppServerEvent;
 
-    fn poll_next(self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<Option<Self::Item>> {
-        self.get_mut().poll_next_event(cx)
+    fn poll_next(
+        mut self: Pin<&mut Self>,
+        cx: &mut Context<'_>,
+    ) -> Poll<Option<Self::Item>> {
+        self.event_rx.poll_recv(cx)
     }
-}
-
-fn is_terminal_thread_event(event: &AppServerEvent) -> bool {
-    matches!(
-        event,
-        AppServerEvent::ServerNotification(ServerNotification::ThreadClosed(_))
-            | AppServerEvent::Disconnected { .. }
-    )
 }
 
 /// Builder for creating a [`Thread`].
@@ -365,9 +347,6 @@ impl ThreadBuilder {
             params.thread_source = Some(ThreadSource::User);
         }
 
-        // Subscribe before `thread/start`; app-server may emit `thread/started`
-        // before the request future resolves.
-        let event_rx = self.codex.runtime().subscribe();
         let response: ThreadStartResponse = self
             .codex
             .request_typed(ClientRequest::ThreadStart {
@@ -379,16 +358,12 @@ impl ThreadBuilder {
         let thread_id = response.thread.id;
         tracing::info!(%thread_id, "started Codex thread");
 
-        Ok(Thread::from_id(self.codex, thread_id, event_rx))
+        self.codex.attach_thread(thread_id)
     }
 }
 
 #[cfg(test)]
 mod tests {
-    use codex_app_server_protocol::{
-        Turn, TurnCompletedNotification, TurnItemsView, TurnStatus,
-    };
-
     use super::*;
 
     #[test]
@@ -396,40 +371,5 @@ mod tests {
         fn assert_stream<T: Stream<Item = AppServerEvent>>() {}
 
         assert_stream::<ThreadEventStream>();
-    }
-
-    #[test]
-    fn turn_completion_does_not_terminate_thread_stream() {
-        let completed = AppServerEvent::ServerNotification(
-            ServerNotification::TurnCompleted(TurnCompletedNotification {
-                thread_id: "thread-1".to_string(),
-                turn: Turn {
-                    id: "turn-1".to_string(),
-                    items: Vec::new(),
-                    items_view: TurnItemsView::Full,
-                    status: TurnStatus::Completed,
-                    error: None,
-                    started_at: Some(1),
-                    completed_at: Some(2),
-                    duration_ms: Some(1_000),
-                },
-            }),
-        );
-        let closed =
-            AppServerEvent::ServerNotification(ServerNotification::ThreadClosed(
-                codex_app_server_protocol::ThreadClosedNotification {
-                    thread_id: "thread-1".to_string(),
-                },
-            ));
-        let disconnected = AppServerEvent::Disconnected {
-            message: "runtime closed".to_string(),
-        };
-
-        assert!(!is_terminal_thread_event(&completed));
-        assert!(is_terminal_thread_event(&closed));
-        assert!(is_terminal_thread_event(&disconnected));
-        assert!(!is_terminal_thread_event(&AppServerEvent::Lagged {
-            skipped: 1,
-        }));
     }
 }

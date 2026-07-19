@@ -1,9 +1,13 @@
+use std::fmt;
 use std::future::{Future, IntoFuture};
 use std::path::PathBuf;
 use std::pin::Pin;
 use std::sync::Arc;
+use std::task::{Context, Poll};
 
-use codex_app_server_client::{RemoteAppServerConnectArgs, RemoteAppServerEndpoint};
+use codex_app_server_client::{
+    AppServerEvent, RemoteAppServerConnectArgs, RemoteAppServerEndpoint,
+};
 use codex_app_server_protocol::{
     AskForApproval, ClientRequest, GetAccountParams, GetAccountResponse, ModelListParams,
     ModelListResponse, RequestId, SandboxMode, ThreadArchiveParams,
@@ -16,12 +20,15 @@ use codex_core::config::{Config, ConfigBuilder, ConfigOverrides, find_codex_home
 use codex_protocol::config_types::{Personality, ReasoningSummary};
 use codex_protocol::openai_models::ReasoningEffort;
 use codex_utils_absolute_path::AbsolutePathBuf;
+use tokio_stream::Stream;
 
 use crate::error::{Error, Result};
-use crate::runtime::{DEFAULT_CHANNEL_CAPACITY, RuntimeHandle};
+use crate::runtime::{
+    DEFAULT_CHANNEL_CAPACITY, EventReceiver, RuntimeHandle, ThreadAttachmentKind,
+};
 use crate::thread::{Thread, ThreadBuilder};
 use crate::turn::{CodexTurnBuilder, IntoTurnInput};
-use crate::types::ClientInfo;
+use crate::types::{ClientInfo, ThreadId};
 use crate::warmup::WarmupBuilder;
 
 /// Handle to a shared Codex app-server runtime.
@@ -41,14 +48,37 @@ struct CodexInner {
     default_thread_params: ThreadStartParams,
 }
 
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, Default)]
 struct RuntimeOptions {
     /// Helper executable paths discovered by `codex_arg0`.
     arg0_paths: Option<Arg0DispatchPaths>,
     /// Client metadata reported to Codex.
     client_info: ClientInfo,
-    /// Capacity for runtime event and command channels.
-    channel_capacity: usize,
+    /// Independent capacities for the upstream connection and SDK streams.
+    channels: ChannelCapacities,
+}
+
+#[derive(Debug, Clone, Copy)]
+struct ChannelCapacities {
+    app_server: usize,
+    event_stream: usize,
+}
+
+impl Default for ChannelCapacities {
+    fn default() -> Self {
+        Self {
+            app_server: DEFAULT_CHANNEL_CAPACITY,
+            event_stream: DEFAULT_CHANNEL_CAPACITY,
+        }
+    }
+}
+
+impl ChannelCapacities {
+    fn set_all(&mut self, capacity: usize) {
+        let capacity = capacity.max(1);
+        self.app_server = capacity;
+        self.event_stream = capacity;
+    }
 }
 
 #[derive(Debug, Clone, Copy, Default)]
@@ -90,19 +120,9 @@ impl PromptContextOptions {
     }
 }
 
-impl Default for RuntimeOptions {
-    fn default() -> Self {
-        Self {
-            arg0_paths: None,
-            client_info: ClientInfo::default(),
-            channel_capacity: DEFAULT_CHANNEL_CAPACITY,
-        }
-    }
-}
-
 impl RuntimeOptions {
-    fn take_arg0_paths(&mut self) -> Arg0DispatchPaths {
-        self.arg0_paths.take().unwrap_or_else(fallback_arg0_paths)
+    fn take_arg0_paths(&mut self) -> Result<Arg0DispatchPaths> {
+        self.arg0_paths.take().ok_or(Error::Arg0DispatchRequired)
     }
 }
 
@@ -142,6 +162,19 @@ impl Codex {
     /// Start building a reusable Codex thread.
     pub fn thread(&self) -> ThreadBuilder {
         ThreadBuilder::new(self.clone())
+    }
+
+    /// Take this runtime's stream of events that do not belong to one thread.
+    ///
+    /// Thread-scoped events are delivered through [`Thread::event_stream`].
+    /// This stream yields runtime notifications, threadless server requests,
+    /// upstream lag reports, and the final disconnection event. A runtime has
+    /// exactly one such stream across all [`Codex`] clones.
+    pub fn event_stream(&self) -> Result<CodexEventStream> {
+        Ok(CodexEventStream {
+            codex: self.clone(),
+            event_rx: self.runtime().take_runtime_events()?,
+        })
     }
 
     /// List available Codex models using server defaults.
@@ -199,7 +232,10 @@ impl Codex {
         &self,
         params: ThreadResumeParams,
     ) -> Result<Thread> {
-        let event_rx = self.runtime().subscribe();
+        let requested_thread_id = params.thread_id.clone();
+        let reservation = self
+            .runtime()
+            .prepare_thread_events(&requested_thread_id, ThreadAttachmentKind::Resume)?;
         let response: ThreadResumeResponse = self
             .request_typed(ClientRequest::ThreadResume {
                 request_id: self.next_request_id(),
@@ -207,7 +243,17 @@ impl Codex {
             })
             .await?;
         let thread_id = response.thread.id;
+        if thread_id != requested_thread_id {
+            drop(reservation);
+            tracing::warn!(
+                requested_thread_id,
+                %thread_id,
+                "thread/resume returned a different thread id"
+            );
+            return self.attach_thread(thread_id);
+        }
         tracing::info!(%thread_id, "resumed Codex thread");
+        let event_rx = reservation.claim()?;
         Ok(Thread::from_id(self.clone(), thread_id, event_rx))
     }
 
@@ -229,7 +275,6 @@ impl Codex {
             params.thread_source = Some(ThreadSource::User);
         }
 
-        let event_rx = self.runtime().subscribe();
         let response: ThreadForkResponse = self
             .request_typed(ClientRequest::ThreadFork {
                 request_id: self.next_request_id(),
@@ -238,7 +283,7 @@ impl Codex {
             .await?;
         let thread_id = response.thread.id;
         tracing::info!(%thread_id, "forked Codex thread");
-        Ok(Thread::from_id(self.clone(), thread_id, event_rx))
+        self.attach_thread(thread_id)
     }
 
     /// List saved Codex threads using server defaults.
@@ -263,28 +308,46 @@ impl Codex {
         &self,
         thread_id: impl Into<String>,
     ) -> Result<ThreadArchiveResponse> {
-        self.request_typed(ClientRequest::ThreadArchive {
-            request_id: self.next_request_id(),
-            params: ThreadArchiveParams {
-                thread_id: thread_id.into(),
-            },
-        })
-        .await
+        let thread_id = thread_id.into();
+        let response = self
+            .request_typed(ClientRequest::ThreadArchive {
+                request_id: self.next_request_id(),
+                params: ThreadArchiveParams {
+                    thread_id: thread_id.clone(),
+                },
+            })
+            .await?;
+        self.runtime().complete_thread_archive(&thread_id)?;
+        Ok(response)
     }
 
     /// Restore an archived Codex thread and return a reusable handle.
     pub async fn unarchive_thread(&self, thread_id: impl Into<String>) -> Result<Thread> {
-        let event_rx = self.runtime().subscribe();
+        let requested_thread_id = thread_id.into();
+        let reservation = self.runtime().prepare_thread_events(
+            &requested_thread_id,
+            ThreadAttachmentKind::Unarchive,
+        )?;
         let response: ThreadUnarchiveResponse = self
             .request_typed(ClientRequest::ThreadUnarchive {
                 request_id: self.next_request_id(),
                 params: ThreadUnarchiveParams {
-                    thread_id: thread_id.into(),
+                    thread_id: requested_thread_id.clone(),
                 },
             })
             .await?;
         let thread_id = response.thread.id;
+        if thread_id != requested_thread_id {
+            drop(reservation);
+            tracing::warn!(
+                requested_thread_id,
+                %thread_id,
+                "thread/unarchive returned a different thread id"
+            );
+            return self.attach_thread(thread_id);
+        }
         tracing::info!(%thread_id, "unarchived Codex thread");
+        let event_rx = reservation.claim()?;
         Ok(Thread::from_id(self.clone(), thread_id, event_rx))
     }
 
@@ -374,8 +437,63 @@ impl Codex {
         &self.inner.runtime
     }
 
+    pub(crate) fn attach_thread(&self, thread_id: ThreadId) -> Result<Thread> {
+        let event_rx = self.runtime().take_thread_events(&thread_id)?;
+        Ok(Thread::from_id(self.clone(), thread_id, event_rx))
+    }
+
     pub(crate) fn default_thread_params(&self) -> &ThreadStartParams {
         &self.inner.default_thread_params
+    }
+}
+
+/// Long-lived stream of events owned by the shared Codex runtime.
+///
+/// Thread events are intentionally excluded; consume those from the matching
+/// [`Thread`]. Dropping this stream does not shut down Codex.
+pub struct CodexEventStream {
+    codex: Codex,
+    event_rx: EventReceiver,
+}
+
+impl CodexEventStream {
+    /// Runtime whose global events this stream yields.
+    pub fn codex(&self) -> &Codex {
+        &self.codex
+    }
+
+    /// Resolve a server request with a method-specific result payload.
+    pub async fn resolve_server_request(
+        &self,
+        request_id: RequestId,
+        result: impl serde::Serialize,
+    ) -> Result<()> {
+        self.codex.resolve_server_request(request_id, result).await
+    }
+
+    /// Resolve a server request with an empty JSON object.
+    pub async fn approve_server_request(&self, request_id: RequestId) -> Result<()> {
+        self.codex.approve_server_request(request_id).await
+    }
+
+    /// Reject a server request with a human-readable message.
+    pub async fn reject_server_request(
+        &self,
+        request_id: RequestId,
+        message: impl Into<String>,
+    ) -> Result<()> {
+        self.codex.reject_server_request(request_id, message).await
+    }
+}
+
+impl Stream for CodexEventStream {
+    type Item = AppServerEvent;
+
+    fn poll_next(
+        mut self: Pin<&mut Self>,
+        cx: &mut Context<'_>,
+    ) -> Poll<Option<Self::Item>> {
+        self.event_rx.poll_recv(cx)
     }
 }
 
@@ -587,20 +705,39 @@ impl CodexBuilder {
         self
     }
 
-    /// Set the capacity of the internal broadcast and command channels.
+    /// Set both app-server and SDK event-stream queue capacities.
     ///
-    /// Small values reduce buffering, while larger values tolerate slower event
-    /// consumers before [`AppServerEvent::Lagged`](crate::AppServerEvent::Lagged)
-    /// appears.
+    /// Transcript, completion, and server-request events apply backpressure
+    /// when full and can pause the shared event pump. Best-effort progress
+    /// events may be replaced by `Lagged`. This does not change the fixed
+    /// pre-attachment event and inactive-route limits.
     pub fn channel_capacity(mut self, capacity: usize) -> Self {
-        self.runtime.channel_capacity = capacity.max(1);
+        self.runtime.channels.set_all(capacity);
+        self
+    }
+
+    /// Set the upstream app-server client's event and command queue capacity.
+    ///
+    /// Increase this independently when transport bursts are larger than each
+    /// application's desired per-stream buffering.
+    pub fn app_server_channel_capacity(mut self, capacity: usize) -> Self {
+        self.runtime.channels.app_server = capacity.max(1);
+        self
+    }
+
+    /// Set the capacity of each SDK runtime or thread event stream queue.
+    ///
+    /// Reliable events apply backpressure when this queue is full; best-effort
+    /// events may be summarized by a later `Lagged` marker.
+    pub fn event_stream_capacity(mut self, capacity: usize) -> Self {
+        self.runtime.channels.event_stream = capacity.max(1);
         self
     }
 
     /// Start the in-process Codex runtime.
     pub async fn start(self) -> Result<Codex> {
         let mut runtime = self.runtime;
-        let arg0_paths = runtime.take_arg0_paths();
+        let arg0_paths = runtime.take_arg0_paths()?;
         let cwd = match self.cwd {
             Some(cwd) => cwd,
             None => std::env::current_dir()?,
@@ -668,13 +805,32 @@ impl CodexWithConfigBuilder {
         self
     }
 
-    /// Set the capacity of the internal broadcast and command channels.
+    /// Set both app-server and SDK event-stream queue capacities.
     ///
-    /// Small values reduce buffering, while larger values tolerate slower event
-    /// consumers before [`AppServerEvent::Lagged`](crate::AppServerEvent::Lagged)
-    /// appears.
+    /// Transcript, completion, and server-request events apply backpressure
+    /// when full and can pause the shared event pump. Best-effort progress
+    /// events may be replaced by `Lagged`. This does not change the fixed
+    /// pre-attachment event and inactive-route limits.
     pub fn channel_capacity(mut self, capacity: usize) -> Self {
-        self.runtime.channel_capacity = capacity.max(1);
+        self.runtime.channels.set_all(capacity);
+        self
+    }
+
+    /// Set the upstream app-server client's event and command queue capacity.
+    ///
+    /// Increase this independently when transport bursts are larger than each
+    /// application's desired per-stream buffering.
+    pub fn app_server_channel_capacity(mut self, capacity: usize) -> Self {
+        self.runtime.channels.app_server = capacity.max(1);
+        self
+    }
+
+    /// Set the capacity of each SDK runtime or thread event stream queue.
+    ///
+    /// Reliable events apply backpressure when this queue is full; best-effort
+    /// events may be summarized by a later `Lagged` marker.
+    pub fn event_stream_capacity(mut self, capacity: usize) -> Self {
+        self.runtime.channels.event_stream = capacity.max(1);
         self
     }
 
@@ -684,7 +840,7 @@ impl CodexWithConfigBuilder {
     }
 }
 
-#[derive(Debug, Clone)]
+#[derive(Clone)]
 enum RemoteEndpointConfig {
     WebSocket {
         websocket_url: String,
@@ -701,16 +857,36 @@ enum RemoteEndpointConfig {
 /// options. Model, sandbox, prompt, and other Codex config defaults belong to
 /// the remote app-server process; use thread/turn builders or native params for
 /// per-request overrides.
-#[derive(Debug, Clone)]
+#[derive(Clone)]
 pub struct CodexRemoteBuilder {
     /// Remote app-server endpoint to connect to.
     endpoint: RemoteEndpointConfig,
     /// Client metadata reported during remote initialize.
     client_info: ClientInfo,
-    /// Capacity for SDK broadcast and command channels.
-    channel_capacity: usize,
+    /// Independent capacities for the upstream connection and SDK streams.
+    channels: ChannelCapacities,
     /// Native Codex defaults copied into new thread builders.
     default_thread_params: ThreadStartParams,
+}
+
+impl fmt::Debug for CodexRemoteBuilder {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        let (transport, auth_configured) = match &self.endpoint {
+            RemoteEndpointConfig::WebSocket { auth_token, .. } => {
+                ("websocket", auth_token.is_some())
+            }
+            RemoteEndpointConfig::UnixSocket { .. } => ("unix_socket", false),
+        };
+
+        formatter
+            .debug_struct("CodexRemoteBuilder")
+            .field("transport", &transport)
+            .field("auth_configured", &auth_configured)
+            .field("client_info", &self.client_info)
+            .field("app_server_channel_capacity", &self.channels.app_server)
+            .field("event_stream_capacity", &self.channels.event_stream)
+            .finish_non_exhaustive()
+    }
 }
 
 impl CodexRemoteBuilder {
@@ -721,7 +897,7 @@ impl CodexRemoteBuilder {
                 auth_token: None,
             },
             client_info: ClientInfo::default(),
-            channel_capacity: DEFAULT_CHANNEL_CAPACITY,
+            channels: ChannelCapacities::default(),
             default_thread_params: remote_default_thread_params(),
         }
     }
@@ -730,7 +906,7 @@ impl CodexRemoteBuilder {
         Self {
             endpoint: RemoteEndpointConfig::UnixSocket { socket_path },
             client_info: ClientInfo::default(),
-            channel_capacity: DEFAULT_CHANNEL_CAPACITY,
+            channels: ChannelCapacities::default(),
             default_thread_params: remote_default_thread_params(),
         }
     }
@@ -763,9 +939,32 @@ impl CodexRemoteBuilder {
         self
     }
 
-    /// Set the capacity of the internal broadcast and command channels.
+    /// Set both app-server and SDK event-stream queue capacities.
+    ///
+    /// Transcript, completion, and server-request events apply backpressure
+    /// when full and can pause the shared event pump. Best-effort progress
+    /// events may be replaced by `Lagged`. This does not change the fixed
+    /// pre-attachment event and inactive-route limits.
     pub fn channel_capacity(mut self, capacity: usize) -> Self {
-        self.channel_capacity = capacity.max(1);
+        self.channels.set_all(capacity);
+        self
+    }
+
+    /// Set the upstream app-server client's event and command queue capacity.
+    ///
+    /// Increase this independently when transport bursts are larger than each
+    /// application's desired per-stream buffering.
+    pub fn app_server_channel_capacity(mut self, capacity: usize) -> Self {
+        self.channels.app_server = capacity.max(1);
+        self
+    }
+
+    /// Set the capacity of each SDK runtime or thread event stream queue.
+    ///
+    /// Reliable events apply backpressure when this queue is full; best-effort
+    /// events may be summarized by a later `Lagged` marker.
+    pub fn event_stream_capacity(mut self, capacity: usize) -> Self {
+        self.channels.event_stream = capacity.max(1);
         self
     }
 
@@ -796,15 +995,18 @@ impl CodexRemoteBuilder {
             }
         };
 
-        let runtime = RuntimeHandle::connect_remote(RemoteAppServerConnectArgs {
-            endpoint,
-            client_name: self.client_info.name,
-            client_version: self.client_info.version,
-            experimental_api: true,
-            mcp_server_openai_form_elicitation: false,
-            opt_out_notification_methods: Vec::new(),
-            channel_capacity: self.channel_capacity,
-        })
+        let runtime = RuntimeHandle::connect_remote(
+            RemoteAppServerConnectArgs {
+                endpoint,
+                client_name: self.client_info.name,
+                client_version: self.client_info.version,
+                experimental_api: true,
+                mcp_server_openai_form_elicitation: false,
+                opt_out_notification_methods: Vec::new(),
+                channel_capacity: self.channels.app_server,
+            },
+            self.channels.event_stream,
+        )
         .await?;
 
         Ok(Codex::from_runtime(runtime, self.default_thread_params))
@@ -812,7 +1014,7 @@ impl CodexRemoteBuilder {
 }
 
 async fn start_with_config(config: Config, mut runtime: RuntimeOptions) -> Result<Codex> {
-    let arg0_paths = runtime.take_arg0_paths();
+    let arg0_paths = runtime.take_arg0_paths()?;
     start_with_config_and_paths(config, runtime, arg0_paths).await
 }
 
@@ -824,11 +1026,17 @@ async fn start_with_config_and_paths(
     let default_thread_params = default_thread_params_from_config(&config);
     let RuntimeOptions {
         client_info,
-        channel_capacity,
+        channels,
         ..
     } = runtime;
-    let runtime =
-        RuntimeHandle::start(arg0_paths, config, client_info, channel_capacity).await?;
+    let runtime = RuntimeHandle::start(
+        arg0_paths,
+        config,
+        client_info,
+        channels.app_server,
+        channels.event_stream,
+    )
+    .await?;
 
     Ok(Codex::from_runtime(runtime, default_thread_params))
 }
@@ -932,19 +1140,6 @@ async fn build_config(
     Ok(config)
 }
 
-fn fallback_arg0_paths() -> Arg0DispatchPaths {
-    let current_exe = std::env::current_exe().ok();
-    Arg0DispatchPaths {
-        codex_self_exe: current_exe.clone(),
-        codex_linux_sandbox_exe: if cfg!(target_os = "linux") {
-            current_exe
-        } else {
-            None
-        },
-        main_execve_wrapper_exe: None,
-    }
-}
-
 impl IntoFuture for CodexBuilder {
     type Output = Result<Codex>;
     type IntoFuture = Pin<Box<dyn Future<Output = Self::Output> + Send>>;
@@ -969,5 +1164,43 @@ impl IntoFuture for CodexRemoteBuilder {
 
     fn into_future(self) -> Self::IntoFuture {
         Box::pin(async move { self.start().await })
+    }
+}
+
+#[cfg(test)]
+mod debug_tests {
+    use super::*;
+
+    #[test]
+    fn remote_builder_debug_redacts_endpoint_and_auth_token() {
+        let builder = Codex::remote_websocket(
+            "wss://example.test/app-server?credential=url-secret",
+        )
+        .auth_token("bearer-secret");
+
+        let debug = format!("{builder:?}");
+        assert!(debug.contains("auth_configured: true"));
+        assert!(!debug.contains("url-secret"));
+        assert!(!debug.contains("bearer-secret"));
+    }
+
+    #[test]
+    fn in_process_runtime_requires_arg0_dispatch_paths() {
+        let mut options = RuntimeOptions::default();
+        assert!(matches!(
+            options.take_arg0_paths(),
+            Err(Error::Arg0DispatchRequired)
+        ));
+    }
+
+    #[test]
+    fn channel_capacities_can_be_tuned_together_or_independently() {
+        let builder = Codex::builder()
+            .channel_capacity(64)
+            .app_server_channel_capacity(128)
+            .event_stream_capacity(16);
+
+        assert_eq!(builder.runtime.channels.app_server, 128);
+        assert_eq!(builder.runtime.channels.event_stream, 16);
     }
 }

@@ -1,247 +1,181 @@
 use codex_app_server_client::AppServerEvent;
 use codex_app_server_protocol::{ServerNotification, ServerRequest};
+use codex_protocol::ThreadId;
 
-pub(crate) fn event_matches(event: &AppServerEvent, thread_id: &str) -> bool {
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum EventTarget {
+    Thread(ThreadId),
+    InvalidThread,
+    Runtime,
+}
+
+pub(crate) fn event_target(event: &AppServerEvent) -> EventTarget {
     match event {
-        AppServerEvent::ServerRequest(request) => request_matches(request, thread_id),
+        AppServerEvent::ServerRequest(request) => request_target(request),
         AppServerEvent::ServerNotification(notification) => {
-            notification_matches(notification, thread_id)
+            notification_target(notification)
         }
-        AppServerEvent::Lagged { .. } | AppServerEvent::Disconnected { .. } => true,
+        AppServerEvent::Lagged { .. } | AppServerEvent::Disconnected { .. } => {
+            EventTarget::Runtime
+        }
     }
 }
 
-fn request_matches(request: &ServerRequest, thread_id: &str) -> bool {
-    match request {
+fn request_target(request: &ServerRequest) -> EventTarget {
+    let thread_id = match request {
         ServerRequest::CommandExecutionRequestApproval { params, .. } => {
-            thread_matches(Some(&params.thread_id), thread_id)
+            Some(params.thread_id.as_str())
         }
         ServerRequest::FileChangeRequestApproval { params, .. } => {
-            thread_matches(Some(&params.thread_id), thread_id)
+            Some(params.thread_id.as_str())
         }
         ServerRequest::ToolRequestUserInput { params, .. } => {
-            thread_matches(Some(&params.thread_id), thread_id)
+            Some(params.thread_id.as_str())
         }
         ServerRequest::McpServerElicitationRequest { params, .. } => {
-            thread_matches(Some(&params.thread_id), thread_id)
+            Some(params.thread_id.as_str())
         }
         ServerRequest::PermissionsRequestApproval { params, .. } => {
-            thread_matches(Some(&params.thread_id), thread_id)
+            Some(params.thread_id.as_str())
         }
-        ServerRequest::DynamicToolCall { params, .. } => {
-            thread_matches(Some(&params.thread_id), thread_id)
-        }
+        ServerRequest::DynamicToolCall { params, .. } => Some(params.thread_id.as_str()),
+        ServerRequest::CurrentTimeRead { params, .. } => Some(params.thread_id.as_str()),
         ServerRequest::ChatgptAuthTokensRefresh { .. }
-        | ServerRequest::AttestationGenerate { .. } => thread_matches(None, thread_id),
-        ServerRequest::CurrentTimeRead { params, .. } => {
-            thread_matches(Some(&params.thread_id), thread_id)
-        }
-        ServerRequest::ApplyPatchApproval { params, .. } => {
-            let conversation_id = params.conversation_id.to_string();
-            thread_matches(Some(&conversation_id), thread_id)
-        }
-        ServerRequest::ExecCommandApproval { params, .. } => {
-            let conversation_id = params.conversation_id.to_string();
-            thread_matches(Some(&conversation_id), thread_id)
-        }
-    }
+        | ServerRequest::AttestationGenerate { .. }
+        | ServerRequest::ApplyPatchApproval { .. }
+        | ServerRequest::ExecCommandApproval { .. } => None,
+    };
+
+    target_from_thread_id(thread_id)
 }
 
-fn notification_matches(notification: &ServerNotification, thread_id: &str) -> bool {
-    match notification {
-        ServerNotification::Error(params) => {
-            thread_matches(Some(&params.thread_id), thread_id)
-        }
-        ServerNotification::ThreadStarted(params) => {
-            thread_matches(Some(&params.thread.id), thread_id)
-        }
+fn notification_target(notification: &ServerNotification) -> EventTarget {
+    let thread_id = match notification {
+        ServerNotification::Error(params) => Some(params.thread_id.as_str()),
+        ServerNotification::ThreadStarted(params) => Some(params.thread.id.as_str()),
         ServerNotification::ThreadStatusChanged(params) => {
-            thread_matches(Some(&params.thread_id), thread_id)
+            Some(params.thread_id.as_str())
         }
-        ServerNotification::ThreadArchived(params) => {
-            thread_matches(Some(&params.thread_id), thread_id)
-        }
-        ServerNotification::ThreadDeleted(params) => {
-            thread_matches(Some(&params.thread_id), thread_id)
-        }
-        ServerNotification::ThreadUnarchived(params) => {
-            thread_matches(Some(&params.thread_id), thread_id)
-        }
-        ServerNotification::ThreadClosed(params) => {
-            thread_matches(Some(&params.thread_id), thread_id)
-        }
-        ServerNotification::SkillsChanged(_) => thread_matches(None, thread_id),
-        ServerNotification::ThreadNameUpdated(params) => {
-            thread_matches(Some(&params.thread_id), thread_id)
-        }
-        ServerNotification::ThreadGoalUpdated(params) => {
-            thread_matches(Some(&params.thread_id), thread_id)
-        }
-        ServerNotification::ThreadGoalCleared(params) => {
-            thread_matches(Some(&params.thread_id), thread_id)
-        }
+        ServerNotification::ThreadArchived(params) => Some(params.thread_id.as_str()),
+        ServerNotification::ThreadDeleted(params) => Some(params.thread_id.as_str()),
+        ServerNotification::ThreadUnarchived(params) => Some(params.thread_id.as_str()),
+        ServerNotification::ThreadClosed(params) => Some(params.thread_id.as_str()),
+        ServerNotification::ThreadNameUpdated(params) => Some(params.thread_id.as_str()),
+        ServerNotification::ThreadGoalUpdated(params) => Some(params.thread_id.as_str()),
+        ServerNotification::ThreadGoalCleared(params) => Some(params.thread_id.as_str()),
         ServerNotification::ThreadSettingsUpdated(params) => {
-            thread_matches(Some(&params.thread_id), thread_id)
+            Some(params.thread_id.as_str())
         }
         ServerNotification::ThreadTokenUsageUpdated(params) => {
-            thread_matches(Some(&params.thread_id), thread_id)
+            Some(params.thread_id.as_str())
         }
-        ServerNotification::TurnStarted(params) => {
-            thread_matches(Some(&params.thread_id), thread_id)
-        }
-        ServerNotification::HookStarted(params) => {
-            thread_matches(Some(&params.thread_id), thread_id)
-        }
-        ServerNotification::TurnCompleted(params) => {
-            thread_matches(Some(&params.thread_id), thread_id)
-        }
-        ServerNotification::HookCompleted(params) => {
-            thread_matches(Some(&params.thread_id), thread_id)
-        }
-        ServerNotification::TurnDiffUpdated(params) => {
-            thread_matches(Some(&params.thread_id), thread_id)
-        }
-        ServerNotification::TurnPlanUpdated(params) => {
-            thread_matches(Some(&params.thread_id), thread_id)
-        }
-        ServerNotification::ItemStarted(params) => {
-            thread_matches(Some(&params.thread_id), thread_id)
-        }
+        ServerNotification::TurnStarted(params) => Some(params.thread_id.as_str()),
+        ServerNotification::HookStarted(params) => Some(params.thread_id.as_str()),
+        ServerNotification::TurnCompleted(params) => Some(params.thread_id.as_str()),
+        ServerNotification::HookCompleted(params) => Some(params.thread_id.as_str()),
+        ServerNotification::TurnDiffUpdated(params) => Some(params.thread_id.as_str()),
+        ServerNotification::TurnPlanUpdated(params) => Some(params.thread_id.as_str()),
+        ServerNotification::ItemStarted(params) => Some(params.thread_id.as_str()),
         ServerNotification::ItemGuardianApprovalReviewStarted(params) => {
-            thread_matches(Some(&params.thread_id), thread_id)
+            Some(params.thread_id.as_str())
         }
         ServerNotification::ItemGuardianApprovalReviewCompleted(params) => {
-            thread_matches(Some(&params.thread_id), thread_id)
+            Some(params.thread_id.as_str())
         }
-        ServerNotification::ItemCompleted(params) => {
-            thread_matches(Some(&params.thread_id), thread_id)
-        }
+        ServerNotification::ItemCompleted(params) => Some(params.thread_id.as_str()),
         ServerNotification::RawResponseItemCompleted(params) => {
-            thread_matches(Some(&params.thread_id), thread_id)
+            Some(params.thread_id.as_str())
         }
-        ServerNotification::AgentMessageDelta(params) => {
-            thread_matches(Some(&params.thread_id), thread_id)
-        }
-        ServerNotification::PlanDelta(params) => {
-            thread_matches(Some(&params.thread_id), thread_id)
-        }
-        ServerNotification::CommandExecOutputDelta(_)
-        | ServerNotification::ProcessOutputDelta(_)
-        | ServerNotification::ProcessExited(_) => thread_matches(None, thread_id),
+        ServerNotification::AgentMessageDelta(params) => Some(params.thread_id.as_str()),
+        ServerNotification::PlanDelta(params) => Some(params.thread_id.as_str()),
         ServerNotification::CommandExecutionOutputDelta(params) => {
-            thread_matches(Some(&params.thread_id), thread_id)
+            Some(params.thread_id.as_str())
         }
         ServerNotification::TerminalInteraction(params) => {
-            thread_matches(Some(&params.thread_id), thread_id)
+            Some(params.thread_id.as_str())
         }
         ServerNotification::FileChangeOutputDelta(params) => {
-            thread_matches(Some(&params.thread_id), thread_id)
+            Some(params.thread_id.as_str())
         }
         ServerNotification::FileChangePatchUpdated(params) => {
-            thread_matches(Some(&params.thread_id), thread_id)
+            Some(params.thread_id.as_str())
         }
         ServerNotification::ServerRequestResolved(params) => {
-            thread_matches(Some(&params.thread_id), thread_id)
+            Some(params.thread_id.as_str())
         }
         ServerNotification::McpToolCallProgress(params) => {
-            thread_matches(Some(&params.thread_id), thread_id)
+            Some(params.thread_id.as_str())
         }
-        ServerNotification::McpServerOauthLoginCompleted(params) => {
-            thread_matches(params.thread_id.as_deref(), thread_id)
+        ServerNotification::ReasoningSummaryTextDelta(params) => {
+            Some(params.thread_id.as_str())
         }
-        ServerNotification::McpServerStatusUpdated(params) => {
-            thread_matches(params.thread_id.as_deref(), thread_id)
+        ServerNotification::ReasoningSummaryPartAdded(params) => {
+            Some(params.thread_id.as_str())
         }
-        ServerNotification::AccountUpdated(_)
+        ServerNotification::ReasoningTextDelta(params) => Some(params.thread_id.as_str()),
+        ServerNotification::ContextCompacted(params) => Some(params.thread_id.as_str()),
+        ServerNotification::ModelRerouted(params) => Some(params.thread_id.as_str()),
+        ServerNotification::ModelVerification(params) => Some(params.thread_id.as_str()),
+        ServerNotification::TurnModerationMetadata(params) => {
+            Some(params.thread_id.as_str())
+        }
+        ServerNotification::ModelSafetyBufferingUpdated(params) => {
+            Some(params.thread_id.as_str())
+        }
+        ServerNotification::Warning(params) => params.thread_id.as_deref(),
+        ServerNotification::GuardianWarning(params) => Some(params.thread_id.as_str()),
+        ServerNotification::McpServerStatusUpdated(params) => params.thread_id.as_deref(),
+        ServerNotification::ThreadRealtimeStarted(params) => {
+            Some(params.thread_id.as_str())
+        }
+        ServerNotification::ThreadRealtimeItemAdded(params) => {
+            Some(params.thread_id.as_str())
+        }
+        ServerNotification::ThreadRealtimeTranscriptDelta(params) => {
+            Some(params.thread_id.as_str())
+        }
+        ServerNotification::ThreadRealtimeTranscriptDone(params) => {
+            Some(params.thread_id.as_str())
+        }
+        ServerNotification::ThreadRealtimeOutputAudioDelta(params) => {
+            Some(params.thread_id.as_str())
+        }
+        ServerNotification::ThreadRealtimeSdp(params) => Some(params.thread_id.as_str()),
+        ServerNotification::ThreadRealtimeError(params) => {
+            Some(params.thread_id.as_str())
+        }
+        ServerNotification::ThreadRealtimeClosed(params) => {
+            Some(params.thread_id.as_str())
+        }
+        ServerNotification::SkillsChanged(_)
+        | ServerNotification::McpServerOauthLoginCompleted(_)
+        | ServerNotification::AccountUpdated(_)
         | ServerNotification::AccountRateLimitsUpdated(_)
         | ServerNotification::AppListUpdated(_)
         | ServerNotification::RemoteControlStatusChanged(_)
         | ServerNotification::ExternalAgentConfigImportProgress(_)
         | ServerNotification::ExternalAgentConfigImportCompleted(_)
-        | ServerNotification::FsChanged(_) => thread_matches(None, thread_id),
-        ServerNotification::ReasoningSummaryTextDelta(params) => {
-            thread_matches(Some(&params.thread_id), thread_id)
-        }
-        ServerNotification::ReasoningSummaryPartAdded(params) => {
-            thread_matches(Some(&params.thread_id), thread_id)
-        }
-        ServerNotification::ReasoningTextDelta(params) => {
-            thread_matches(Some(&params.thread_id), thread_id)
-        }
-        ServerNotification::ContextCompacted(params) => {
-            thread_matches(Some(&params.thread_id), thread_id)
-        }
-        ServerNotification::ModelRerouted(params) => {
-            thread_matches(Some(&params.thread_id), thread_id)
-        }
-        ServerNotification::ModelVerification(params) => {
-            thread_matches(Some(&params.thread_id), thread_id)
-        }
-        ServerNotification::TurnModerationMetadata(params) => {
-            thread_matches(Some(&params.thread_id), thread_id)
-        }
-        ServerNotification::ModelSafetyBufferingUpdated(params) => {
-            thread_matches(Some(&params.thread_id), thread_id)
-        }
-        ServerNotification::Warning(params) => {
-            thread_matches(params.thread_id.as_deref(), thread_id)
-        }
-        ServerNotification::GuardianWarning(params) => {
-            thread_matches(Some(&params.thread_id), thread_id)
-        }
-        ServerNotification::DeprecationNotice(_)
+        | ServerNotification::DeprecationNotice(_)
         | ServerNotification::ConfigWarning(_)
         | ServerNotification::FuzzyFileSearchSessionUpdated(_)
-        | ServerNotification::FuzzyFileSearchSessionCompleted(_) => {
-            thread_matches(None, thread_id)
-        }
-        ServerNotification::ThreadRealtimeStarted(params) => {
-            thread_matches(Some(&params.thread_id), thread_id)
-        }
-        ServerNotification::ThreadRealtimeItemAdded(params) => {
-            thread_matches(Some(&params.thread_id), thread_id)
-        }
-        ServerNotification::ThreadRealtimeTranscriptDelta(params) => {
-            thread_matches(Some(&params.thread_id), thread_id)
-        }
-        ServerNotification::ThreadRealtimeTranscriptDone(params) => {
-            thread_matches(Some(&params.thread_id), thread_id)
-        }
-        ServerNotification::ThreadRealtimeOutputAudioDelta(params) => {
-            thread_matches(Some(&params.thread_id), thread_id)
-        }
-        ServerNotification::ThreadRealtimeSdp(params) => {
-            thread_matches(Some(&params.thread_id), thread_id)
-        }
-        ServerNotification::ThreadRealtimeError(params) => {
-            thread_matches(Some(&params.thread_id), thread_id)
-        }
-        ServerNotification::ThreadRealtimeClosed(params) => {
-            thread_matches(Some(&params.thread_id), thread_id)
-        }
-        ServerNotification::WindowsWorldWritableWarning(_)
+        | ServerNotification::FuzzyFileSearchSessionCompleted(_)
+        | ServerNotification::CommandExecOutputDelta(_)
+        | ServerNotification::ProcessOutputDelta(_)
+        | ServerNotification::ProcessExited(_)
+        | ServerNotification::FsChanged(_)
+        | ServerNotification::WindowsWorldWritableWarning(_)
         | ServerNotification::WindowsSandboxSetupCompleted(_)
-        | ServerNotification::AccountLoginCompleted(_) => thread_matches(None, thread_id),
-    }
+        | ServerNotification::AccountLoginCompleted(_) => None,
+    };
+
+    target_from_thread_id(thread_id)
 }
 
-fn thread_matches(event_thread_id: Option<&str>, thread_id: &str) -> bool {
-    event_thread_id.is_none_or(|event_thread_id| event_thread_id == thread_id)
-}
-
-#[cfg(test)]
-mod tests {
-    use super::*;
-
-    #[test]
-    fn thread_scoped_events_only_match_their_thread() {
-        assert!(thread_matches(Some("thread-1"), "thread-1"));
-        assert!(!thread_matches(Some("thread-2"), "thread-1"));
-    }
-
-    #[test]
-    fn global_events_match_every_thread() {
-        assert!(thread_matches(None, "thread-1"));
-        assert!(thread_matches(None, "thread-2"));
+fn target_from_thread_id(thread_id: Option<&str>) -> EventTarget {
+    match thread_id {
+        Some(thread_id) => ThreadId::from_string(thread_id)
+            .map(EventTarget::Thread)
+            .unwrap_or(EventTarget::InvalidThread),
+        None => EventTarget::Runtime,
     }
 }

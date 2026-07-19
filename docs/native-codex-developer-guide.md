@@ -425,9 +425,9 @@ If the caller already has a complete native `Config`, the SDK should accept it
 through `Codex::builder_with_config(config)` /
 `CodexMain::builder_with_config(config)`. `CodexWithConfigBuilder` should only
 expose runtime options that are not part of `Config`, such as `client_name`,
-`client_version`, and `channel_capacity`. For new configuration capabilities,
-prefer exposing Codex native types over adding SDK-specific `Options` /
-`Config` middle structures.
+`client_version`, and the app-server/event-stream capacity controls. For new
+configuration capabilities, prefer exposing Codex native types over adding
+SDK-specific `Options` / `Config` middle structures.
 
 ### InProcessClientStartArgs
 
@@ -451,7 +451,14 @@ maintaining it, pay close attention to:
 - `experimental_api`: whether to enable experimental app-server fields/methods.
 - `mcp_server_openai_form_elicitation`: whether to allow MCP OpenAI extended
   form elicitation.
-- `channel_capacity`: event/request channel capacity.
+- `channel_capacity`: convenience setting for both upstream app-server queues
+  and each SDK event-stream queue.
+- `app_server_channel_capacity`: independently sizes upstream transport event
+  and command queues.
+- `event_stream_capacity`: independently sizes each live SDK event queue.
+  Reliable transcript/completion/request events backpressure the shared event
+  pump; best-effort progress events can produce `Lagged`. These settings do not
+  configure the fixed pre-attachment limits.
 
 ## ServerRequest Handling Principles
 
@@ -468,10 +475,13 @@ Design principles:
   MCP elicitation action/content.
 - Request ids must come from the current client event stream.
 - Events only carry native Codex request data; resolve/reject behavior that owns
-  the runtime belongs on `Codex` or `ThreadEventStream` methods.
-- Most requests should be routed precisely by thread/turn. Global requests that
-  lack thread/turn ids may be seen by multiple active streams; applications
-  should handle them idempotently by `RequestId`.
+  the runtime belongs on `Codex`, `CodexEventStream`, or `ThreadEventStream`
+  methods.
+- Requests with a thread target go to exactly one `ThreadEventStream`.
+  Threadless requests go to the single `CodexEventStream`.
+- The pinned upstream client does not expose a split response handle. The SDK
+  therefore bounds the complete response queue/write operation to 30 seconds;
+  a stalled response can pause event reads until completion or timeout.
 
 ## Thread Concurrency Boundary
 
@@ -497,7 +507,8 @@ handles for the same ID.
 ## Event Dispatch Boundary
 
 Each thread exposes one long-lived
-`codex_app_server_client::AppServerEvent` stream directly:
+`codex_app_server_client::AppServerEvent` stream directly. The shared runtime
+exposes one separate `CodexEventStream` for events without a thread target:
 
 - `AppServerEvent::ServerNotification(codex_app_server_protocol::ServerNotification)`
 - `AppServerEvent::ServerRequest(codex_app_server_protocol::ServerRequest)`
@@ -510,13 +521,26 @@ fields. When upgrading the Codex tag, a compile failure from a new
 `ServerRequest` / `ServerNotification` variant is a useful signal: decide
 explicitly whether it is turn-scoped, thread-scoped, or global.
 
-Dispatch from the runtime to `ThreadEventStream` currently uses a Tokio
-broadcast channel. A receiver is created before thread start/resume/fork or
-unarchive, then retained by `Thread` until the application takes it. Slow
-consumers receive `Lagged { skipped }`; this means the stream may have missed
-deltas, requests, or `TurnCompleted`. `TurnCompleted` is a turn boundary, not a
-stream boundary. `ThreadClosed` and runtime disconnection are stream terminal
-events.
+The runtime classifies every request and notification using typed protocol
+fields, then routes it once to either the matching thread mailbox or the runtime
+mailbox. Thread traffic is isolated, and per-thread ordering is preserved.
+Because lifecycle notifications can arrive before a start/resume/fork/unarchive
+request returns, each unclaimed mailbox retains up to 32,768 events and replays
+them when the `Thread` is attached. The router retains at most 1,024 inactive or
+unattached thread mailboxes. These fixed limits are separate from
+`channel_capacity` and `event_stream_capacity`; event overflow evicts the oldest
+event and is reported by `Lagged`. Claimed mailboxes keep transcript deltas,
+completion notifications, and `ServerRequest` values lossless by applying
+backpressure; best-effort progress events may be skipped and summarized by
+`Lagged`. Consume
+every claimed stream continuously because one full reliable queue pauses the
+shared event pump and can delay unrelated threads. `TurnCompleted` is a turn
+boundary, not a stream boundary.
+Successful SDK archive calls establish a local `ThreadArchived` boundary even
+if the upstream best-effort notification is delayed or dropped. Observed
+`ThreadDeleted` and `ThreadClosed` notifications are delivered before their
+thread stream ends. A later unarchive owns a new attachment and stream. Runtime
+disconnection is delivered before every active stream ends.
 
 ## Dependency Audit Boundary
 
@@ -544,10 +568,9 @@ it.
   fields can also have convenience setters.
 - The event layer should expose native `ServerNotification` and
   `ServerRequest` directly; runtime-backed response behavior belongs on
-  `Codex` / `ThreadEventStream`.
-- Event subscription should happen before the thread lifecycle request that
-  creates its handle, so fast initial events are buffered before the handle is
-  returned.
+  `Codex`, `CodexEventStream`, or `ThreadEventStream`.
+- Event routing must retain fast initial events until the thread lifecycle
+  request returns and the resulting `Thread` claims its mailbox.
 - Shutdown should close the runtime and give long-lived connections or
   background tasks a clear shutdown path.
 - When updating the Codex git tag, run the

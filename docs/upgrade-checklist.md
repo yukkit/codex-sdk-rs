@@ -63,8 +63,11 @@ For every new or changed `ServerNotification`, decide:
 
 - Does it belong to a specific `thread_id`?
 - Does it belong to a specific `turn_id`?
-- Is it global and should active thread streams see it?
+- Is it runtime-scoped and therefore owned by `CodexEventStream`?
 - Does the thread stream need new terminal or routing behavior for it?
+- Must it remain reliable under live-queue backpressure? Keep
+  `src/runtime/events.rs::event_requires_delivery` aligned with upstream
+  `app-server-client` transcript/completion delivery policy.
 
 For `ThreadStartParams` and `TurnStartParams`, decide:
 
@@ -78,7 +81,7 @@ For `ThreadStartParams` and `TurnStartParams`, decide:
 For every new or changed `ServerRequest`, decide:
 
 - Does it carry `thread_id` and/or `turn_id`?
-- Should it be delivered to one active thread stream or treated as global?
+- Should it be delivered to one thread stream or to `CodexEventStream`?
 - What response type should callers pass to `Codex::resolve_server_request()`
   or `ThreadEventStream::resolve_server_request()`?
 - Is `approve_server_request()` with `{}` still valid for that request?
@@ -91,17 +94,16 @@ Verify these SDK boundary assumptions still hold:
 - `AppServerEvent::ServerRequest` should expose the native `ServerRequest`
   directly. Runtime behavior such as resolve/reject belongs on `Codex` or
   `ThreadEventStream`.
-- Thread start/resume/fork/unarchive paths must subscribe before issuing their
-  lifecycle request, so the thread stream cannot miss fast initial events.
+- Thread start/resume/fork/unarchive paths must retain events that arrive before
+  the lifecycle response identifies or returns the thread.
 - `TurnCompleted` must remain a normal event and must not end the thread stream.
 - `ServerRequest` variants must remain visible to matching thread streams.
 - Explicit `Codex::shutdown()` should notify streams with `Disconnected` and
   wait for the runtime task to exit.
 - The SDK should not add implicit turn serialization. Applications own the
   no-overlap contract for turns sharing a thread ID.
-- Global `ServerRequest`s that lack thread/turn ids may be visible to multiple
-  active thread streams. If Codex adds more global requests, document the expected
-  application-level de-duplication behavior.
+- Runtime-scoped `ServerRequest`s that lack a thread target must be delivered
+  once through `CodexEventStream`.
 
 ## 5. Recheck Dependency Policy
 

@@ -121,7 +121,8 @@ protocol field. Principles:
 ### Prelude Strategy
 
 `prelude` only contains types that are used frequently in day-to-day code:
-`Codex`, builders, `Thread`, `ThreadEventStream`, `TurnBuilder`, `TurnHandle`,
+`Codex`, `CodexEventStream`, builders, `Thread`, `ThreadEventStream`,
+`TurnBuilder`, `TurnHandle`,
 `Account`, `Model`, core params, `SandboxMode`, `SandboxPolicy`,
 `AskForApproval`, `ReasoningEffort`, `ReasoningSummary`, `UserInput`, and
 similar types.

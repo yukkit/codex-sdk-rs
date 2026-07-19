@@ -7,7 +7,7 @@ use codex_protocol::config_types::{Personality, ReasoningSummary};
 use codex_protocol::openai_models::ReasoningEffort;
 
 use crate::client::Codex;
-use crate::error::Result;
+use crate::error::{Error, Result};
 use crate::runtime::RuntimeHandle;
 use crate::thread::Thread;
 use crate::types::{TurnId, cwd_to_string};
@@ -218,6 +218,10 @@ impl CodexTurnBuilder {
     }
 
     /// Create the temporary thread, start the turn, and return its handle.
+    ///
+    /// If thread creation succeeds but `turn/start` fails, the returned
+    /// [`Error::TemporaryTurnStart`] retains
+    /// the created [`Thread`] so its event stream and state remain recoverable.
     pub async fn start(self) -> Result<TurnHandle> {
         let thread = self
             .codex
@@ -225,9 +229,15 @@ impl CodexTurnBuilder {
             .params(self.thread_params)
             .start()
             .await?;
-        TurnBuilder::from_params(thread, self.turn_params)
+        let thread_id = thread.id().to_string();
+        TurnBuilder::from_params(thread.clone(), self.turn_params)
             .start()
             .await
+            .map_err(|source| Error::TemporaryTurnStart {
+                thread_id,
+                thread,
+                source: Box::new(source),
+            })
     }
 }
 
@@ -400,7 +410,8 @@ impl TurnBuilder {
     /// Start the turn and return its control handle.
     ///
     /// Consume events from [`Thread::event_stream`], which spans every turn in
-    /// this thread.
+    /// this thread. The SDK does not serialize turns; wait for the preceding
+    /// turn's `TurnCompleted` before starting another turn for the same thread.
     pub async fn start(self) -> Result<TurnHandle> {
         let thread_id = self.thread.id().to_string();
         let mut params = self.params;

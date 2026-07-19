@@ -5,7 +5,8 @@ to work directly with the Codex app-server JSON-RPC protocol, `AppServerClient`,
 `InProcessAppServerClient`, or Codex internal crates; the SDK provides a stable
 Rust API:
 
-- `Codex`: a shared Codex runtime.
+- `Codex` / `CodexEventStream`: a shared Codex runtime and its single stream of
+  runtime-scoped events.
 - `Thread` / `ThreadEventStream`: a conversation and its single long-lived
   stream of events across all turns.
 - `TurnBuilder` / `TurnHandle`: one user request and optional active-turn
@@ -219,7 +220,14 @@ Field notes:
 - `default_sandbox`: default sandbox.
 - `default_approval_policy`: default approval policy.
 - `ephemeral`: whether sessions are ephemeral by default.
-- `channel_capacity`: runtime event broadcast buffer size.
+- `channel_capacity`: convenience setting for both the upstream app-server
+  queues and each SDK event-stream queue.
+- `app_server_channel_capacity`: independently sizes upstream transport event
+  and command queues.
+- `event_stream_capacity`: independently sizes each live SDK event queue.
+  Transcript, completion, and `ServerRequest` events apply backpressure;
+  best-effort progress events may be replaced by a `Lagged` marker. These
+  settings do not configure the fixed pre-attachment limits.
 
 Replace the default prompt and reduce optional context:
 
@@ -259,7 +267,8 @@ let codex = ctx
 ```
 
 `CodexWithConfigBuilder` only exposes runtime options that are not part of
-`Config`, such as `client_name`, `client_version`, and `channel_capacity`.
+`Config`, such as `client_name`, `client_version`, `channel_capacity`,
+`app_server_channel_capacity`, and `event_stream_capacity`.
 Values such as `cwd`, `model`, `model_provider`, `service_tier`,
 `personality`, `default_sandbox`, `default_approval_policy`, `ephemeral`,
 base/developer instructions, and prompt context switches must come from the
@@ -424,10 +433,27 @@ let forked = resumed.fork().await?;
 let _page = codex.list_threads().await?;
 
 forked.set_name("investigation").await?;
+let forked_id = forked.id().to_string();
+let mut forked_events = forked.event_stream()?;
 forked.archive().await?;
-let restored = codex.unarchive_thread(forked.id()).await?;
+while let Some(event) = forked_events.next().await {
+    if matches!(
+        event,
+        AppServerEvent::ServerNotification(ServerNotification::ThreadArchived(_))
+    ) {
+        break;
+    }
+}
+let restored = codex.unarchive_thread(forked_id).await?;
 let _snapshot = restored.read(true).await?;
 ```
+
+`ThreadArchived` is delivered as the old stream's final event. A successful
+`archive()` response establishes that local boundary before it returns, so an
+immediate `unarchive_thread(...)` is safe even when the upstream notification is
+still queued. Unarchive creates a new `Thread` attachment with a new long-lived
+stream. `ThreadDeleted` and `ThreadClosed` are terminal when their notifications
+are observed.
 
 Use `resume_thread_params(...)`, `fork_thread_params(...)`, or
 `list_threads_params(...)` when you need the full native app-server request
@@ -543,17 +569,44 @@ Common events:
 - `ServerNotification`: native Codex app-server notifications, such as
   `AgentMessageDelta`, `TurnCompleted`, `Error`, token usage, and so on.
 - `ServerRequest`: requests that the application needs to answer.
-- `Lagged`: the event buffer skipped messages.
+- `Lagged`: the upstream source, bounded pre-attachment buffer, or a full live
+  event queue skipped best-effort messages.
 - `Disconnected`: the runtime connection closed.
 
 `AppServerEvent` is the native Codex app-server client event type. Its protocol
 payloads are native `ServerNotification` / `ServerRequest` values, so Codex
 protocol field and variant changes are exposed directly at compile time.
 
-Note: the underlying event distribution currently uses a broadcast channel.
-`Lagged` means this consumer has missed some events; interactive UIs should mark
-the affected thread as needing refresh or retry. The SDK does not synthesize a
-batch result or hide native turn status; inspect `TurnCompleted` directly.
+The runtime routes each thread-scoped event directly to its owning
+`ThreadEventStream`; traffic from other threads does not consume that stream's
+queue. Events that arrive before `thread/start`, resume, fork, or unarchive
+returns are retained in a fixed 32,768-event per-thread pre-attachment buffer
+and replayed in order. At most 1,024 inactive or unattached thread routes are
+retained; the oldest route is evicted when that limit is exceeded. Neither
+`channel_capacity()` nor `event_stream_capacity()` configures these fixed
+limits. Event overflow removes the oldest event and prepends `Lagged` when the
+stream attaches; in an extreme pre-attachment burst this can remove a reliable
+event.
+Live queues preserve transcript deltas, completion notifications, and all
+`ServerRequest` values by applying backpressure. Progress-style events are
+best-effort under pressure; the next deliverable event is preceded by `Lagged`
+when any were skipped. Consume active streams continuously so one full reliable
+queue does not pause the shared app-server event pump.
+The SDK does not synthesize a batch result or hide native turn status; inspect
+`TurnCompleted` directly.
+
+Events without a thread target belong to the shared runtime. Take the one
+runtime stream when the application needs account/config notifications,
+threadless server requests, lag reports, or disconnect handling:
+
+```rust,no_run
+use tokio_stream::StreamExt;
+
+let mut runtime_events = codex.event_stream()?;
+while let Some(event) = runtime_events.next().await {
+    tracing::debug!(?event, "runtime event");
+}
+```
 
 ## Handling ServerRequest
 
@@ -586,6 +639,11 @@ For simple approvals, `approve_server_request()` sends `{}`. For complex
 requests, match the native `ServerRequest` variant and pass the matching typed
 response; you can also pass `serde_json::json!` directly:
 
+The pinned app-server client currently serializes a server-request response
+write with reads from the same event source. The SDK bounds the complete queue
+and write operation to 30 seconds; a stalled write can pause event forwarding
+until it completes or times out.
+
 ```rust,no_run
 stream
     .resolve_server_request(
@@ -615,10 +673,9 @@ codex
 ```
 
 Most `ServerRequest`s carry thread/turn ids, and the SDK delivers them only to
-the matching `ThreadEventStream`. A small number of global Codex requests do not
-carry thread/turn ids and may be visible to multiple active streams. For those
-requests, de-duplicate at the application layer by `RequestId` and resolve or
-reject through the shared `Codex` handle.
+the matching `ThreadEventStream`. Requests without a thread target are delivered
+once through `CodexEventStream`. Both stream types expose the same resolve,
+approve, and reject helpers.
 
 ## TurnStartParams
 
@@ -847,6 +904,8 @@ Codex selecting a skill based on its description.
 Recommended structure:
 
 - Create one shared `Codex` when the process starts.
+- Take its optional `CodexEventStream` once when the application handles
+  runtime-scoped notifications or threadless requests.
 - Create one `Thread` for each browser/business session.
 - Take one `ThreadEventStream` and keep it connected for that thread's lifetime.
 - Start a `Turn` for each user input; route its events by `turn_id` without
@@ -868,9 +927,9 @@ to isolate `CODEX_HOME`, providers, MCP, or local state.
 codex.shutdown().await?;
 ```
 
-Dropping the final `Codex`, `Thread`, `TurnHandle`, or `ThreadEventStream` also
-signals runtime shutdown. Call `shutdown()` explicitly when the service needs
-to await bounded cleanup and observe shutdown errors.
+Dropping the final `Codex`, `Thread`, `TurnHandle`, `ThreadEventStream`, or
+`CodexEventStream` also signals runtime shutdown. Call `shutdown()` explicitly
+when the service needs to await bounded cleanup and observe shutdown errors.
 
 `ObservabilityGuard` tries to flush on drop. If you need deterministic flushing:
 
@@ -887,11 +946,23 @@ The SDK error type is `codex_sdk::Error`:
 
 - `Config`: Codex config failed to load.
 - `RuntimeStart`: app-server runtime failed to start.
+- `Arg0DispatchRequired`: in-process startup was attempted without helper paths
+  from `run_main` or an explicit `arg0_paths(...)` call.
 - `RuntimeClosed`: runtime/event stream closed.
+- `CodexEventStreamTaken`: the runtime's single global event stream was already
+  taken from this handle or one of its clones.
 - `ThreadEventStreamTaken`: the thread's single event stream was already taken
   from this handle or one of its clones.
+- `ThreadLifecycleInProgress`: resume or unarchive already owns the route for
+  that thread id.
+- `TemporaryTurnStart`: `Codex::turn(...)` created its temporary thread but the
+  first `turn/start` failed; `temporary_thread()` exposes the still-attached
+  `Thread`, and `into_temporary_turn_failure()` returns it with the root error.
+- `InvalidThreadId`: a thread id could not be parsed as a native Codex thread id.
 - `RuntimeTask`: runtime background task failed during shutdown.
-- `RuntimeShutdown` / `RuntimeShutdownTimeout`: bounded runtime cleanup failed.
+- `RuntimeShutdown` / `RuntimeShutdownTimeout` / `RuntimeShutdownFailed`:
+  bounded runtime cleanup failed, including a failure remembered by a later
+  idempotent shutdown call.
 - `Protocol`: JSON-RPC/app-server protocol error.
 - `Approval` / `ServerRequestResponseTimeout`: server request response failed.
 - `Observability`: OTel/tracing initialization failed.

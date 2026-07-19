@@ -19,7 +19,7 @@ notifications, requests, lag, and disconnection events.
 This crate is an early implementation over Codex's app-server protocol.
 
 - Crate version: `0.1.0`
-- Minimum Rust version: `1.85.0`
+- Minimum Rust version: `1.95.0`
 - Upstream Codex Rust crates: `rust-v0.144.4`
 - crates.io publishing: not enabled yet
 
@@ -140,6 +140,7 @@ a Unix socket.
 | `Codex::builder_with_config(config)` | Start in-process with a native `codex_core::config::Config`. |
 | `Codex::remote_websocket(url)` | Connect to a remote WebSocket app-server. |
 | `Codex::remote_unix_socket(path)` | Connect to a remote Unix-socket app-server. |
+| `codex.event_stream()?` | Take the runtime's stream of events without a thread target. |
 | `codex.thread().start().await?` | Create a reusable thread. |
 | `thread.event_stream()?` | Take the thread's long-lived native event stream. |
 | `codex.request_typed::<T>(request).await?` | Send an arbitrary native `ClientRequest`. |
@@ -156,6 +157,22 @@ Thread events are always consumed as a stream so applications can process
 native status, error, output, and `ServerRequest` events across any number of
 turns without a second batch-result model. `TurnCompleted` marks one turn's
 completion; it does not end the thread stream.
+
+Successful SDK archive calls deliver `ThreadArchived` before the old stream
+ends, even if the upstream notification is delayed or dropped. Observed
+`ThreadDeleted` and `ThreadClosed` notifications are terminal in the same way;
+unarchive creates a new `Thread` attachment and stream.
+
+Consume each active stream continuously. Live queues preserve transcript,
+completion, and `ServerRequest` events with backpressure; progress-style events
+may be skipped under pressure and reported through `Lagged`. Because the event
+pump is shared, one full reliable queue can delay events for other threads.
+
+Do not overlap turns for the same thread ID. Wait for its `TurnCompleted` event
+before starting the next turn; different thread IDs can run concurrently.
+
+Runtime-scoped notifications and threadless server requests are delivered once
+through `CodexEventStream`, rather than being copied into every thread stream.
 
 ## Configuration Model
 

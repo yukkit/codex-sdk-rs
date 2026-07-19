@@ -7,12 +7,14 @@ use codex_app_server_protocol::{
     ClientRequest, JSONRPCErrorError, RequestId, Result as JsonRpcResult,
 };
 use tokio::sync::{mpsc, oneshot};
+use tokio::time::Instant;
 
 use crate::error::{Error, Result};
 
 // Server responses share the driver's event loop. Bounding each write prevents
 // a broken connection from stopping event forwarding indefinitely.
 const SERVER_RESPONSE_TIMEOUT: Duration = Duration::from_secs(30);
+const SERVER_RESPONSE_QUEUE_CAPACITY: usize = 32;
 const SHUTDOWN_TIMEOUT: Duration = Duration::from_secs(10);
 
 /// Operations that do not require mutable access to the event source. The full
@@ -32,6 +34,7 @@ pub(super) struct AppServerDriver {
 struct ServerResponseCommand {
     request_id: RequestId,
     action: ServerResponseAction,
+    deadline: Instant,
     completion: oneshot::Sender<Result<()>>,
 }
 
@@ -41,12 +44,11 @@ enum ServerResponseAction {
 }
 
 impl AppServerDriver {
-    pub(super) fn new(
-        client: AppServerClient,
-        channel_capacity: usize,
-    ) -> (Self, AppServerHandle) {
+    pub(super) fn new(client: AppServerClient) -> (Self, AppServerHandle) {
         let requests = client.request_handle();
-        let (response_tx, response_rx) = mpsc::channel(channel_capacity);
+        // Server responses are rare control messages. Their queue has a small
+        // fixed bound so event-stream tuning cannot accidentally change it.
+        let (response_tx, response_rx) = mpsc::channel(SERVER_RESPONSE_QUEUE_CAPACITY);
         (
             Self {
                 client,
@@ -66,6 +68,9 @@ impl AppServerDriver {
         loop {
             tokio::select! {
                 Some(response) = self.responses.recv() => {
+                    // The pinned upstream client does not expose a split server-
+                    // response handle, so this write temporarily owns the event
+                    // source. Its end-to-end deadline bounds that pause.
                     self.handle_response(response).await;
                 }
                 event = self.client.next_event() => return event,
@@ -92,18 +97,25 @@ impl AppServerDriver {
         let ServerResponseCommand {
             request_id,
             action,
+            deadline,
             completion,
         } = response;
+        if Instant::now() >= deadline {
+            let _ = completion.send(server_response_timeout());
+            return;
+        }
         let result = match action {
             ServerResponseAction::Resolve(result) => {
-                with_server_response_timeout(
+                with_server_response_deadline(
                     self.client.resolve_server_request(request_id, result),
+                    deadline,
                 )
                 .await
             }
             ServerResponseAction::Reject(error) => {
-                with_server_response_timeout(
+                with_server_response_deadline(
                     self.client.reject_server_request(request_id, error),
+                    deadline,
                 )
                 .await
             }
@@ -112,16 +124,20 @@ impl AppServerDriver {
     }
 }
 
-async fn with_server_response_timeout<F>(response: F) -> Result<()>
+async fn with_server_response_deadline<F>(response: F, deadline: Instant) -> Result<()>
 where
     F: Future<Output = std::io::Result<()>>,
 {
-    match tokio::time::timeout(SERVER_RESPONSE_TIMEOUT, response).await {
+    match tokio::time::timeout_at(deadline, response).await {
         Ok(result) => result.map_err(Error::approval),
-        Err(_) => Err(Error::ServerRequestResponseTimeout {
-            timeout: SERVER_RESPONSE_TIMEOUT,
-        }),
+        Err(_) => server_response_timeout(),
     }
+}
+
+fn server_response_timeout() -> Result<()> {
+    Err(Error::ServerRequestResponseTimeout {
+        timeout: SERVER_RESPONSE_TIMEOUT,
+    })
 }
 
 impl AppServerHandle {
@@ -170,14 +186,44 @@ impl AppServerHandle {
         action: ServerResponseAction,
     ) -> Result<()> {
         let (completion, completed) = oneshot::channel();
-        self.responses
-            .send(ServerResponseCommand {
-                request_id,
-                action,
-                completion,
-            })
-            .await
-            .map_err(|_| Error::RuntimeClosed)?;
-        completed.await.map_err(|_| Error::RuntimeClosed)?
+        let deadline = Instant::now() + SERVER_RESPONSE_TIMEOUT;
+        let response = async {
+            self.responses
+                .send(ServerResponseCommand {
+                    request_id,
+                    action,
+                    deadline,
+                    completion,
+                })
+                .await
+                .map_err(|_| Error::RuntimeClosed)?;
+            completed.await.map_err(|_| Error::RuntimeClosed)?
+        };
+
+        match tokio::time::timeout_at(deadline, response).await {
+            Ok(result) => result,
+            Err(_) => server_response_timeout(),
+        }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use std::future::pending;
+
+    use super::*;
+
+    #[tokio::test]
+    async fn server_response_deadline_bounds_the_entire_write() {
+        let result = with_server_response_deadline(
+            pending::<std::io::Result<()>>(),
+            Instant::now() + Duration::from_millis(1),
+        )
+        .await;
+
+        assert!(matches!(
+            result,
+            Err(Error::ServerRequestResponseTimeout { .. })
+        ));
     }
 }

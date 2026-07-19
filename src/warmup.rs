@@ -15,6 +15,7 @@
 use std::future::{Future, IntoFuture};
 use std::path::PathBuf;
 use std::pin::Pin;
+use std::time::Duration;
 
 use codex_app_server_protocol::{
     AppsListParams, AppsListResponse, ClientRequest, ConfigRequirementsReadResponse,
@@ -26,8 +27,10 @@ use codex_app_server_protocol::{
 use tracing::Instrument;
 
 use crate::client::Codex;
-use crate::error::Result;
+use crate::error::{Error, Result};
 use crate::types::cwd_to_string;
+
+const DEFAULT_STEP_TIMEOUT: Duration = Duration::from_secs(30);
 
 #[derive(Debug, Clone)]
 struct WarmupTargets {
@@ -40,6 +43,7 @@ struct WarmupTargets {
     account: bool,
     mcp_status: bool,
     apps: bool,
+    step_timeout: Duration,
 }
 
 impl Default for WarmupTargets {
@@ -54,6 +58,7 @@ impl Default for WarmupTargets {
             account: true,
             mcp_status: true,
             apps: false,
+            step_timeout: DEFAULT_STEP_TIMEOUT,
         }
     }
 }
@@ -218,6 +223,15 @@ impl WarmupBuilder {
         self
     }
 
+    /// Set the maximum duration of each individual warmup request.
+    ///
+    /// A timed-out step is recorded in [`WarmupResult::failures`] and later
+    /// steps continue normally. The default is 30 seconds per request.
+    pub fn step_timeout(mut self, timeout: Duration) -> Self {
+        self.targets.step_timeout = timeout;
+        self
+    }
+
     /// Run the warmup requests.
     ///
     /// Requests are executed sequentially to keep app-server startup behavior
@@ -250,8 +264,7 @@ impl WarmupBuilder {
 
         if self.targets.models {
             match self
-                .codex
-                .request_typed::<ModelListResponse>(ClientRequest::ModelList {
+                .request::<ModelListResponse>(ClientRequest::ModelList {
                     request_id: self.codex.next_request_id(),
                     params: ModelListParams {
                         include_hidden: Some(true),
@@ -267,8 +280,7 @@ impl WarmupBuilder {
 
         if self.targets.skills {
             match self
-                .codex
-                .request_typed::<SkillsListResponse>(ClientRequest::SkillsList {
+                .request::<SkillsListResponse>(ClientRequest::SkillsList {
                     request_id: self.codex.next_request_id(),
                     params: SkillsListParams {
                         cwds: cwd.into_iter().collect(),
@@ -287,8 +299,7 @@ impl WarmupBuilder {
 
         if self.targets.permission_profiles {
             match self
-                .codex
-                .request_typed::<PermissionProfileListResponse>(
+                .request::<PermissionProfileListResponse>(
                     ClientRequest::PermissionProfileList {
                         request_id: self.codex.next_request_id(),
                         params: PermissionProfileListParams {
@@ -307,8 +318,7 @@ impl WarmupBuilder {
 
         if self.targets.config_requirements {
             match self
-                .codex
-                .request_typed::<ConfigRequirementsReadResponse>(
+                .request::<ConfigRequirementsReadResponse>(
                     ClientRequest::ConfigRequirementsRead {
                         request_id: self.codex.next_request_id(),
                         params: None,
@@ -325,8 +335,7 @@ impl WarmupBuilder {
 
         if self.targets.account {
             match self
-                .codex
-                .request_typed::<GetAccountResponse>(ClientRequest::GetAccount {
+                .request::<GetAccountResponse>(ClientRequest::GetAccount {
                     request_id: self.codex.next_request_id(),
                     params: GetAccountParams {
                         refresh_token: false,
@@ -341,8 +350,7 @@ impl WarmupBuilder {
 
         if self.targets.mcp_status {
             match self
-                .codex
-                .request_typed::<ListMcpServerStatusResponse>(
+                .request::<ListMcpServerStatusResponse>(
                     ClientRequest::McpServerStatusList {
                         request_id: self.codex.next_request_id(),
                         params: ListMcpServerStatusParams {
@@ -362,8 +370,7 @@ impl WarmupBuilder {
 
         if self.targets.apps {
             match self
-                .codex
-                .request_typed::<AppsListResponse>(ClientRequest::AppsList {
+                .request::<AppsListResponse>(ClientRequest::AppsList {
                     request_id: self.codex.next_request_id(),
                     params: AppsListParams {
                         cursor: None,
@@ -380,6 +387,41 @@ impl WarmupBuilder {
         }
 
         result
+    }
+
+    async fn request<T>(
+        &self,
+        request: ClientRequest,
+    ) -> std::result::Result<T, WarmupStepError>
+    where
+        T: serde::de::DeserializeOwned,
+    {
+        match tokio::time::timeout(
+            self.targets.step_timeout,
+            self.codex.request_typed(request),
+        )
+        .await
+        {
+            Ok(result) => result.map_err(WarmupStepError::Request),
+            Err(_) => Err(WarmupStepError::Timeout(self.targets.step_timeout)),
+        }
+    }
+}
+
+#[derive(Debug)]
+enum WarmupStepError {
+    Request(Error),
+    Timeout(Duration),
+}
+
+impl std::fmt::Display for WarmupStepError {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Self::Request(error) => error.fmt(formatter),
+            Self::Timeout(timeout) => {
+                write!(formatter, "warmup request timed out after {timeout:?}")
+            }
+        }
     }
 }
 
