@@ -5,7 +5,7 @@ understand lower-level Codex behavior. It explains how the native Codex
 app-server starts, where configuration comes from, how file configuration and
 code configuration are layered, and how these concepts map inside this crate.
 
-This document is based on the Codex manual fetched on 2026-07-15. Official
+This document is based on the Codex manual fetched on 2026-07-20. Official
 entry points:
 
 - Configuration basics: https://learn.chatgpt.com/docs/config-file/config-basic
@@ -126,6 +126,11 @@ Provider API keys are usually not fixed Codex environment variables. Instead,
 the provider configuration specifies the variable name through `env_key`.
 
 ## Common config.toml Configuration
+
+For small, complete configurations organized by deployment scenario, see
+[Typical Native `config.toml` Recipes](sdk-user-guide.md#typical-native-configtoml-recipes).
+The sections below are the field-by-field reference used to extend those
+recipes.
 
 ### Model And Provider
 
@@ -380,9 +385,10 @@ Startup flow, roughly:
    `ClientRequest::TurnStart`.
 
 Remote mode does not use local `ConfigBuilder` / `InProcessClientStartArgs`.
-`CodexRemoteBuilder` only builds `RemoteAppServerConnectArgs`; config, auth,
-tooling, sandbox, working directory, and other runtime defaults belong to the
-remote app-server. The local SDK still uses the same `ClientRequest` /
+`CodexRemoteBuilder` builds `RemoteAppServerConnectArgs` and can retain complete
+native `ThreadStartParams` as SDK-side defaults; config, auth, tooling, sandbox,
+working directory, and other high-level runtime defaults belong to the remote
+app-server. The local SDK still uses the same `ClientRequest` /
 `ServerNotification` / `ServerRequest` surface.
 
 ### ConfigBuilder And ConfigOverrides
@@ -395,8 +401,8 @@ ConfigBuilder::default()
     .harness_overrides(ConfigOverrides {
         cwd: Some(cwd),
         model,
-        approval_policy: Some(approval_policy),
-        sandbox_mode: Some(sandbox_mode),
+        approval_policy: approval_policy.map(AskForApproval::to_core),
+        sandbox_mode: sandbox.map(SandboxMode::to_core),
         codex_self_exe: arg0_paths.codex_self_exe.clone(),
         codex_linux_sandbox_exe: arg0_paths.codex_linux_sandbox_exe.clone(),
         main_execve_wrapper_exe: arg0_paths.main_execve_wrapper_exe.clone(),
@@ -408,7 +414,9 @@ ConfigBuilder::default()
 ```
 
 These overrides are similar to "one-off code-layer configuration" and take
-priority over file defaults. They are appropriate for:
+priority over file defaults when present. `CodexBuilder` keeps sandbox and
+approval overrides as `Option`s so omitted SDK setters preserve native Codex
+config and trust defaults. Explicit overrides are appropriate for:
 
 - The current process working directory.
 - Service-enforced default sandbox/approval.
@@ -423,11 +431,21 @@ management layer.
 
 If the caller already has a complete native `Config`, the SDK should accept it
 through `Codex::builder_with_config(config)` /
-`CodexMain::builder_with_config(config)`. `CodexWithConfigBuilder` should only
-expose runtime options that are not part of `Config`, such as `client_name`,
-`client_version`, and the app-server/event-stream capacity controls. For new
-configuration capabilities, prefer exposing Codex native types over adding
-SDK-specific `Options` / `Config` middle structures.
+`CodexMain::builder_with_config(config)`. The app-server does not use that object
+as the base for each thread: it reloads `CODEX_HOME` and project layers during
+`thread/start`. The SDK therefore takes an explicit snapshot of common effective
+values into `ThreadStartParams`, including sandbox/permissions, reasoning,
+instructions, prompt-context switches, and the explicit service-tier clear state.
+
+`CodexWithConfigBuilder` exposes runtime options plus
+`pure_chat_profile()` (including project-document suppression), its independent
+prompt/tool/environment controls,
+`default_thread_config_overrides(...)`, and `default_thread_params(...)` as native
+escape hatches. A resolved `Config` cannot be losslessly converted back into all
+of its source overrides, so uncommon direct in-memory mutations must be carried
+through one of those thread-level APIs. For new configuration capabilities,
+prefer native dotted config keys or Codex protocol types over adding another
+SDK-specific `Options` / `Config` middle structure.
 
 ### InProcessClientStartArgs
 

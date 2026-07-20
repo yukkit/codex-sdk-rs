@@ -36,8 +36,8 @@ preserving Rust builder style and native Codex protocol escape hatches.
 | Capability | TypeScript SDK | Python SDK | Current Rust SDK | Notes |
 | --- | --- | --- | --- | --- |
 | Client/runtime startup | `new Codex(options)` | `Codex(config)` / `AsyncCodex(config)` | `Codex::builder()` / `builder_with_config(config)` / `remote_websocket(url)` / `remote_unix_socket(path)` | Rust supports in-process and remote app-server backends. |
-| Runtime configuration | `CodexOptions`: `codexPathOverride`, `baseUrl`, `apiKey`, `config`, `env` | `CodexConfig`: `codex_bin`, `launch_args_override`, `config_overrides`, `cwd`, `env`, client metadata | In-process: `CodexBuilder` / `CodexWithConfigBuilder`; remote: `CodexRemoteBuilder` only exposes transport/client identity | In remote mode, Codex config belongs to the remote app-server and is not read from the local builder. |
-| Native escape hatch | `CodexOptions.config` only becomes CLI `--config` overrides | `thread_start(config=...)` and similar methods can carry protocol config fragments; high-level methods map to generated params | `builder_with_config(Config)`, `thread_params(...)`, `turn_params(...)`, `*_params(...)` | Rust preserves native `Config` and app-server params instead of copying every low-frequency field into a second SDK struct. |
+| Runtime configuration | `CodexOptions`: `codexPathOverride`, `baseUrl`, `apiKey`, `config`, `env` | `CodexConfig`: `codex_bin`, `launch_args_override`, `config_overrides`, `cwd`, `env`, client metadata | In-process: `CodexBuilder` / `CodexWithConfigBuilder`; remote: transport/client identity plus complete native thread defaults | In-process sandbox/approval setters are explicit overrides; omitted values inherit native config and trust defaults. In remote mode, runtime config belongs to the app-server. |
+| Native escape hatch | `CodexOptions.config` only becomes CLI `--config` overrides | `thread_start(config=...)` and similar methods can carry protocol config fragments; high-level methods map to generated params | `builder_with_config(Config)`, in-process `default_thread_config_overrides(...)`, universal `default_thread_params(...)`, `thread_params(...)`, `turn_params(...)`, `*_params(...)` | Rust projects common resolved defaults and preserves native config/params escape hatches for fields reloaded at `thread/start`. |
 | Create thread | `codex.startThread(options)` | `codex.thread_start(...)` | `codex.thread().start().await?` | Semantics are aligned; Rust uses a builder. |
 | Resume thread | `codex.resumeThread(id, options)` | `codex.thread_resume(id, ...)` | `codex.resume_thread(id).await?` / `resume_thread_params(...)` | Core capability is aligned. |
 | List/fork/archive | No high-level API | `thread_list` / `thread_fork` / `thread_archive` / `thread_unarchive` | `list_threads` / `fork_thread` / `archive_thread` / `unarchive_thread`, plus `Thread::fork` / `Thread::archive` | Rust is currently closer to Python. |
@@ -59,7 +59,9 @@ preserving Rust builder style and native Codex protocol escape hatches.
 | cwd/model/model_provider | `workingDirectory` / `model`; no model provider | `cwd` / `model` / `model_provider` | `cwd` / `model` / `model_provider` | Rust is closer to Python. |
 | Service tier / personality | No high-level API | Supported on thread and turn params | Builder/thread/turn support `service_tier` / `personality` | Common setters are present. |
 | Base/developer instructions | No high-level API | `base_instructions` / `developer_instructions`, mainly on thread lifecycle methods | Runtime, thread, and temporary-thread builders have same-name setters | Existing threads do not support changing instructions for a single turn; create/resume/fork a thread or use thread lifecycle params. |
-| Prompt context toggles | None | No high-level API | `minimal_prompt_context()` and `include_*_instructions(...)` | Rust adds high-level support for embedded low-token or chat-only scenarios. |
+| Prompt context toggles | None | No high-level API | In-process `minimal_prompt_context()` and `include_*_instructions(...)` | Rust adds high-level support for embedded low-token or chat-only scenarios. |
+| Minimal tool profile | Native config overrides | Native config overrides | In-process `minimal_tools()` | Disables known configurable tool families and discovery surfaces; it is not an all-tools-off guarantee. |
+| Pure chat profile / environment access | Native config overrides | Native params | In-process `pure_chat_profile()` / `EnvironmentAccess` | The profile composes prompt, project-document, tool, and environment settings; each can be overridden later in builder order. |
 | Login/account/models | None | `login_api_key` / `login_chatgpt` / `account` / `logout` / `models` | `models` / `models_params`, `account` / `account_params`; login/logout are missing | Rust has read-only P1 coverage; login flow remains the host system's responsibility or a future high-level API. |
 | Errors/retry | Plain `Error` | Public error types / `retry_on_overload` | `Error` / `Result` | Rust has basic errors; retry is not yet wrapped in a high-level helper. |
 
@@ -114,9 +116,11 @@ protocol field. Principles:
 - Low-frequency or experimental fields are exposed through native params such
   as `ThreadStartParams`, `TurnStartParams`, `ThreadResumeParams`,
   `ThreadForkParams`, and `ThreadListParams`.
-- Runtime configuration already expressed by `Config` is not copied into a new
-  SDK struct; applications that have parsed native `Config` should use
-  `builder_with_config(config)`.
+- Common effective runtime configuration is projected from `Config` into native
+  thread params because embedded app-server threads reload file/project layers.
+  Applications with uncommon in-memory mutations should use
+  `default_thread_config_overrides(...)` or `default_thread_params(...)` rather
+  than introducing another SDK config struct.
 
 ### Prelude Strategy
 

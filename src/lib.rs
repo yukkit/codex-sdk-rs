@@ -7,6 +7,7 @@ mod event;
 mod observability;
 mod runtime;
 mod thread;
+mod thread_defaults;
 mod turn;
 mod types;
 mod warmup;
@@ -21,8 +22,8 @@ pub use codex_app_server_protocol::{
     ServerNotification, ServerRequest, ThreadArchiveResponse, ThreadCompactStartResponse,
     ThreadForkParams, ThreadForkResponse, ThreadListParams, ThreadListResponse,
     ThreadReadResponse, ThreadResumeParams, ThreadResumeResponse, ThreadSetNameResponse,
-    ThreadStartParams, ThreadUnarchiveResponse, TurnInterruptResponse, TurnStartParams,
-    TurnSteerResponse, UserInput,
+    ThreadStartParams, ThreadUnarchiveResponse, TurnEnvironmentParams,
+    TurnInterruptResponse, TurnStartParams, TurnSteerResponse, UserInput,
 };
 pub use codex_core::config::Config;
 pub use codex_protocol::config_types::{Personality, ReasoningSummary};
@@ -37,6 +38,7 @@ pub use observability::{
     traceparent_context_from_env,
 };
 pub use thread::{Thread, ThreadBuilder, ThreadEventStream};
+pub use thread_defaults::EnvironmentAccess;
 pub use turn::{CodexTurnBuilder, IntoTurnInput, TurnBuilder, TurnHandle};
 pub use types::{ThreadId, TurnId};
 pub use warmup::{WarmupBuilder, WarmupFailure, WarmupResult};
@@ -46,13 +48,13 @@ pub mod prelude {
     pub use crate::{
         Account, AppServerEvent, AskForApproval, ClientRequest, Codex, CodexBuilder,
         CodexEventStream, CodexMain, CodexRemoteBuilder, CodexTurnBuilder,
-        CodexWithConfigBuilder, Config, Error, GetAccountParams, IntoTurnInput, Model,
-        ModelListParams, Observability, ObservabilityBuilder, ObservabilityGuard,
-        OtelExporter, OtelHttpProtocol, OtelSettings, Personality, ReasoningEffort,
-        ReasoningSummary, RequestId, Result, SandboxMode, SandboxPolicy,
+        CodexWithConfigBuilder, Config, EnvironmentAccess, Error, GetAccountParams,
+        IntoTurnInput, Model, ModelListParams, Observability, ObservabilityBuilder,
+        ObservabilityGuard, OtelExporter, OtelHttpProtocol, OtelSettings, Personality,
+        ReasoningEffort, ReasoningSummary, RequestId, Result, SandboxMode, SandboxPolicy,
         ServerNotification, ServerRequest, Thread, ThreadBuilder, ThreadEventStream,
         ThreadForkParams, ThreadListParams, ThreadResumeParams, ThreadStartParams,
-        TurnBuilder, TurnHandle, TurnStartParams, UserInput, WarmupBuilder,
-        WarmupFailure, WarmupResult, run_main,
+        TurnBuilder, TurnEnvironmentParams, TurnHandle, TurnStartParams, UserInput,
+        WarmupBuilder, WarmupFailure, WarmupResult, run_main,
     };
 }

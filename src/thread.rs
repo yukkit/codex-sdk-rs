@@ -16,6 +16,7 @@ use tokio_stream::Stream;
 use crate::client::Codex;
 use crate::error::{Error, Result};
 use crate::runtime::EventReceiver;
+use crate::thread_defaults::EnvironmentAccess;
 use crate::turn::{IntoTurnInput, TurnBuilder};
 use crate::types::{ThreadId, cwd_to_string};
 
@@ -274,6 +275,12 @@ impl ThreadBuilder {
     pub fn cwd(mut self, cwd: impl Into<std::path::PathBuf>) -> Self {
         let cwd = cwd.into();
         self.params.cwd = Some(cwd_to_string(&cwd));
+        self
+    }
+
+    /// Select how this thread resolves its execution environment.
+    pub fn environment_access(mut self, access: EnvironmentAccess) -> Self {
+        access.apply_to_thread(&mut self.params);
         self
     }
 

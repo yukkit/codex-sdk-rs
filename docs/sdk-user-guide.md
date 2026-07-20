@@ -101,9 +101,10 @@ belong to the remote app-server process; they are not read from local
 `thread.turn(...).xxx(...)`, or native `ThreadStartParams` / `TurnStartParams`
 for per-request overrides.
 
-`CodexRemoteBuilder::default_thread_params(...)` sets SDK-side defaults copied
-into new thread builders. This mainly affects temporary-thread conveniences such
-as `codex.turn(...)`.
+`CodexRemoteBuilder::default_thread_params(...)` can copy one complete native
+request into new thread builders. Higher-level configuration profiles stay on
+the in-process builders, where their relationship to the locally resolved
+Codex configuration is explicit.
 
 ## Cargo Dependency
 
@@ -174,6 +175,142 @@ configs/
 
 Note: if you set `CODEX_HOME`, the directory must already exist.
 
+## Typical Native `config.toml` Recipes
+
+Native Codex configuration is useful for durable runtime policy that should
+also apply outside this SDK. Put personal or service-wide defaults in
+`CODEX_HOME/config.toml`; put trusted repository overrides in
+`.codex/config.toml`. Project configuration is ignored for untrusted projects.
+
+The examples below are intentionally small. Copy one as a starting point, then
+add only the settings the deployment owns. TOML root keys must appear before
+tables such as `[sandbox_workspace_write]`, and secrets should come from the
+environment rather than being written into the file. See the official
+[configuration basics](https://learn.chatgpt.com/docs/config-file/config-basic)
+and [configuration reference](https://learn.chatgpt.com/docs/config-file/config-reference)
+for the complete schema.
+
+### Interactive Coding Agent
+
+A balanced default for a developer working interactively in a repository:
+
+```toml
+model_reasoning_effort = "high"
+model_reasoning_summary = "auto"
+personality = "pragmatic"
+
+approval_policy = "on-request"
+approvals_reviewer = "user"
+sandbox_mode = "workspace-write"
+web_search = "cached"
+
+[sandbox_workspace_write]
+network_access = false
+```
+
+This lets Codex edit the workspace while asking before it needs to cross the
+sandbox boundary. Cached web search does not grant shell commands outbound
+network access; enable `sandbox_workspace_write.network_access` separately only
+when command-line tools need it.
+
+### Read-only Review Agent
+
+For source inspection, design review, or audit jobs that must not modify the
+workspace:
+
+```toml
+model_reasoning_effort = "high"
+model_reasoning_summary = "auto"
+
+approval_policy = "never"
+sandbox_mode = "read-only"
+web_search = "disabled"
+```
+
+With `approval_policy = "never"`, work that requires broader permission fails
+instead of producing an approval prompt. This is useful for unattended review
+jobs where a write or network fallback would be surprising.
+
+### Unattended Agent In An Isolated Worker
+
+For CI or a disposable worker where writes inside the checked-out workspace are
+expected, but outbound network and most inherited credentials are not:
+
+```toml
+model_reasoning_effort = "medium"
+model_reasoning_summary = "none"
+
+approval_policy = "never"
+sandbox_mode = "workspace-write"
+web_search = "disabled"
+
+[sandbox_workspace_write]
+network_access = false
+
+[shell_environment_policy]
+inherit = "core"
+exclude = ["AWS_*", "AZURE_*", "GITHUB_TOKEN"]
+```
+
+Keep the outer worker or container isolated as well. `workspace-write` limits
+Codex-launched work; it is not a replacement for deployment-level isolation.
+
+### Chat-oriented Runtime Baseline
+
+For an application using Codex as a conversational model rather than a coding
+agent:
+
+```toml
+model_reasoning_effort = "low"
+model_reasoning_summary = "none"
+model_verbosity = "low"
+
+approval_policy = "never"
+sandbox_mode = "read-only"
+web_search = "disabled"
+project_doc_max_bytes = 0
+```
+
+This native baseline disables project instructions and web search, makes
+permission escalation fail without prompting, and prevents local workspace
+writes. It does not remove shell or other tool schemas, so `config.toml` alone
+does not guarantee an empty prompt or tool list. In an in-process SDK
+integration, also call `pure_chat_profile()`; it applies the prompt-context,
+tool-family, and environment overrides that match the Codex revision pinned by
+this crate. Supply the chatbot role with `base_instructions(...)` as shown in
+[Pure Chatbot Configuration](#pure-chatbot-configuration).
+
+### Runtime With An MCP Knowledge Server
+
+For a read-oriented agent backed by a remote knowledge service:
+
+```toml
+approval_policy = "on-request"
+sandbox_mode = "read-only"
+
+[mcp_servers.knowledge]
+url = "https://mcp.example.com/mcp"
+bearer_token_env_var = "KNOWLEDGE_MCP_TOKEN"
+enabled_tools = ["search", "fetch"]
+default_tools_approval_mode = "prompt"
+startup_timeout_sec = 20
+tool_timeout_sec = 60
+```
+
+The bearer token value stays in `KNOWLEDGE_MCP_TOKEN`; the TOML contains only
+the environment-variable name. Replace the URL and tool names with those
+advertised by the actual server. `sandbox_mode = "read-only"` constrains local
+commands and files, not operations performed by a remote MCP server. The MCP
+boundary in this example comes from `enabled_tools` plus
+`default_tools_approval_mode = "prompt"`.
+
+Explicit SDK builder calls remain the process-owned override layer. For example,
+calling `.default_sandbox(...)` or `.reasoning_effort(...)` takes precedence for
+new threads created by the in-process runtime. If these setters are omitted,
+`ctx.builder()` preserves the resolved native Codex values instead of replacing
+them with SDK defaults. A remote `CodexRemoteBuilder` does not load local
+`config.toml`; place these settings beside the remote app-server instead.
+
 ## In-process Builder Configuration
 
 `ctx.builder()` returns a `CodexBuilder`, which lets the SDK load native Codex
@@ -217,8 +354,20 @@ Field notes:
 - `minimal_prompt_context`: disables optional permissions, apps, collaboration
   mode, environment, and skills instruction blocks for pure chat or low-token
   sessions. It does not remove base instructions or tool schemas.
-- `default_sandbox`: default sandbox.
-- `default_approval_policy`: default approval policy.
+- `minimal_tools`: disables the configurable Codex tool families and discovery
+  surfaces for each new thread. Core, environment-dependent, user-MCP, and
+  dynamic tools can remain, so this is not an all-tools-off guarantee.
+- `default_environment_access`: chooses whether new threads inherit Codex's
+  default environment, disable environment access, or select explicit environments.
+- `pure_chat_profile`: disables optional prompt context, project-document
+  loading, known configurable tools, and environment access for a chat-oriented
+  default.
+- `default_thread_config_overrides`: merges native dotted config keys into every
+  `thread/start`; use this escape hatch for less common current Codex settings.
+- `default_sandbox`: explicit sandbox override; if omitted, native Codex config
+  and trust defaults are preserved.
+- `default_approval_policy`: explicit approval-policy override; if omitted,
+  native Codex config and trust defaults are preserved.
 - `ephemeral`: whether sessions are ephemeral by default.
 - `channel_capacity`: convenience setting for both the upstream app-server
   queues and each SDK event-stream queue.
@@ -228,6 +377,12 @@ Field notes:
   Transcript, completion, and `ServerRequest` events apply backpressure;
   best-effort progress events may be replaced by a `Lagged` marker. These
   settings do not configure the fixed pre-attachment limits.
+
+The embedded app-server resolves config again for every new thread. Runtime
+defaults are snapshotted from the startup `Config` into `thread/start`, while
+prompt-context, tool-profile, and other thread-only setters are recorded directly
+as ordered `thread/start` overrides. Changing the working directory therefore
+cannot silently restore a file-config value over an SDK builder default.
 
 Replace the default prompt and reduce optional context:
 
@@ -246,8 +401,9 @@ let codex = ctx
 For finer control, use `include_permissions_instructions(false)`,
 `include_apps_instructions(false)`, `include_collaboration_mode_instructions(false)`,
 `include_environment_context(false)`, or `include_skill_instructions(false)`. These
-are code-layer overrides on `CodexBuilder`; when using
-`builder_with_config(config)`, edit the supplied native `Config` directly.
+are code-layer overrides on `CodexBuilder`. With `builder_with_config(config)`,
+common resolved values are projected automatically; use
+`default_thread_config_overrides(...)` for other direct thread-scoped mutations.
 
 ### Pure Chatbot Configuration
 
@@ -268,7 +424,7 @@ let codex = ctx
     .developer_instructions(
         "Keep answers concise. Ask one clarifying question when the request is ambiguous.",
     )
-    .minimal_prompt_context()
+    .pure_chat_profile()
     .default_sandbox(SandboxMode::ReadOnly)
     .ephemeral(true)
     .start()
@@ -290,13 +446,61 @@ defaults, on `ThreadBuilder` before creating a reusable thread, or on
 `CodexTurnBuilder` when creating a one-turn temporary thread. A later
 `turn/start` on an existing thread cannot replace its base instructions.
 
-`minimal_prompt_context()` disables permission, app, collaboration-mode,
-environment, and skill instruction blocks. It deliberately does not remove:
+`pure_chat_profile()` bundles the settings needed for a chat-oriented thread:
+
+- `minimal_prompt_context()` disables permission, app, collaboration-mode,
+  environment, and skill instruction blocks;
+- `minimal_tools()` disables the configurable tool families and plugin/app
+  discovery described below;
+- `project_doc_max_bytes = 0` disables `AGENTS.md` and fallback project-document
+  loading;
+- `default_environment_access(EnvironmentAccess::Disabled)` sends
+  `thread/start.environments = []`, preventing selection of the default local
+  environment and removing environment-dependent tools such as `apply_patch`
+  and `view_image`.
+
+These changes are recorded as ordered thread defaults, so a later builder call
+can deliberately re-enable an individual setting. `minimal_prompt_context()` by
+itself deliberately does not remove:
 
 - conversation history or the current user message;
 - tool schemas exposed by Codex;
 - `AGENTS.md` discovered from the configured working directory;
 - enabled MCP servers, plugins, memories, or other extension-provided context.
+
+`minimal_tools()` applies these native settings. They are grouped here by the
+capability they remove:
+
+| Setting | Effect when disabled |
+| --- | --- |
+| `features.apps` | Removes the ChatGPT app/connector surface and prevents app connectors from becoming model tools. |
+| `features.plugins` | Stops loading plugin-provided skills, MCP servers, and tools; this also removes generic `plugins_instructions` when no selected plugin remains. |
+| `features.tool_suggest` | Removes plugin/app discovery recommendations, the `recommended_plugins` context block, and `request_plugin_install`. It normally requires both apps and plugins. |
+| `orchestrator.skills.enabled` | Hides skills supplied by the host/orchestrator. It does not disable ordinary filesystem skills by itself. |
+| `orchestrator.mcp.enabled` | Hides the orchestrator-owned `codex_apps` MCP server. User-configured MCP servers are unaffected. |
+| `features.shell_tool`, `features.code_mode`, `features.code_mode_only` | Removes shell execution and JavaScript code-mode entry points such as `exec_command`, `write_stdin`, or code-mode wrappers. |
+| `features.multi_agent`, `features.multi_agent_v2`, `features.enable_fanout` | Removes sub-agent collaboration and fanout/job tools. |
+| `features.image_generation` | Removes the model-visible image-generation namespace. |
+| `features.memories` | Disables the memory extension, including memory context and any dedicated memory tools. |
+| `features.goals` | Disables the goal extension and its model-visible goal tools. |
+| `features.deferred_executor` | Removes the tool used to wait for a deferred environment executor. |
+| `features.request_permissions_tool` | Removes the model-visible permission-request tool. This is separate from sandbox/approval policy. |
+| `features.token_budget` | Removes context-window/token-budget utility tools. |
+| `features.current_time_reminder` | Removes current-time and configured sleep utility tools. |
+| `features.standalone_web_search`, `web_search = "disabled"` | Disables extension-backed and hosted web-search surfaces. |
+| `tools.experimental_request_user_input.enabled` | Removes `request_user_input`. |
+
+Call `default_thread_config_overrides(...)` after `minimal_tools()` to re-enable
+one selected config capability. Thread-default builder calls are applied in
+order, including complete `default_thread_params(...)` replacements. Environment
+access is a protocol field rather than a config override; set it with
+`default_environment_access(...)` on an in-process runtime builder or
+`environment_access(...)` on a thread/turn builder.
+
+`EnvironmentAccess` preserves the protocol's three states: `Inherit` omits the
+field, `Disabled` sends an empty list, and `Selected(...)` sends explicit
+environment IDs and working directories. On a new thread, `Inherit` selects the
+Codex default; on an existing thread's turn, it keeps the thread's sticky value.
 
 For a predictable chat-only deployment, use a dedicated `codex_home` without
 unneeded MCP/plugin/memory configuration and a dedicated `cwd` without project
@@ -325,12 +529,34 @@ let codex = ctx
 ```
 
 `CodexWithConfigBuilder` only exposes runtime options that are not part of
-`Config`, such as `client_name`, `client_version`, `channel_capacity`,
-`app_server_channel_capacity`, and `event_stream_capacity`.
-Values such as `cwd`, `model`, `model_provider`, `service_tier`,
-`personality`, `default_sandbox`, `default_approval_policy`, `ephemeral`,
-base/developer instructions, and prompt context switches must come from the
-supplied native `Config`.
+`Config`, plus native thread-default escape hatches. The SDK takes an explicit
+snapshot of common effective values—such as `cwd`, model/provider, service tier,
+personality, sandbox or named permissions, approval policy/reviewer, reasoning,
+ephemeral state, instructions, and prompt-context switches—and forwards it
+through `thread/start` automatically.
+
+The app-server still reloads `CODEX_HOME` and project config layers for each
+thread. A resolved `Config` does not retain enough provenance to convert every
+possible direct field mutation back into TOML overrides. Carry uncommon
+thread-scoped in-memory mutations explicitly with dotted native config keys:
+
+```rust,no_run
+use std::collections::HashMap;
+use serde_json::json;
+
+let codex = ctx
+    .builder_with_config(config)
+    .default_thread_config_overrides(HashMap::from([
+        ("features.plugins".to_string(), json!(false)),
+        ("project_doc_max_bytes".to_string(), json!(0)),
+    ]))
+    .start()
+    .await?;
+```
+
+Use `default_thread_params(ThreadStartParams)` when replacing the complete
+native default request is preferable. Per-thread `thread().params(...)` and
+per-turn native params remain available for narrower overrides.
 
 ## SandboxMode
 
@@ -1102,10 +1328,10 @@ preserving `thread_id`, `turn_id`, and request id in logs.
 Where to put configuration:
 
 - SDK builder: overrides explicitly owned by this process, such as
-  `client_name`, `cwd`, and default sandbox.
+  `client_name`, `cwd`, and an explicitly selected default sandbox.
 - SDK builder: also a good place for process-wide base/developer instructions
   and default reasoning/prompt-size policy such as `reasoning_effort`,
-  `reasoning_summary`, and `minimal_prompt_context()`.
+  `reasoning_summary`, or the composed `pure_chat_profile()`.
 - `CODEX_HOME/config.toml`: long-lived user/service defaults, such as model
   provider, MCP, OTel, and auth store.
 - Project `.codex/config.toml`: repo-scoped sandbox, MCP, hooks, and model

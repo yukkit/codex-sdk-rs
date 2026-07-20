@@ -1,3 +1,4 @@
+use std::collections::HashMap;
 use std::fmt;
 use std::future::{Future, IntoFuture};
 use std::path::PathBuf;
@@ -27,6 +28,13 @@ use crate::runtime::{
     DEFAULT_CHANNEL_CAPACITY, EventReceiver, RuntimeHandle, ThreadAttachmentKind,
 };
 use crate::thread::{Thread, ThreadBuilder};
+use crate::thread_defaults::{
+    EnvironmentAccess, INCLUDE_APPS_INSTRUCTIONS_CONFIG_KEY,
+    INCLUDE_COLLABORATION_MODE_INSTRUCTIONS_CONFIG_KEY,
+    INCLUDE_ENVIRONMENT_CONTEXT_CONFIG_KEY, INCLUDE_PERMISSIONS_INSTRUCTIONS_CONFIG_KEY,
+    INCLUDE_SKILL_INSTRUCTIONS_CONFIG_KEY, ThreadDefaultsOverrides,
+    thread_defaults_snapshot,
+};
 use crate::turn::{CodexTurnBuilder, IntoTurnInput};
 use crate::types::{ClientInfo, ThreadId};
 use crate::warmup::WarmupBuilder;
@@ -78,45 +86,6 @@ impl ChannelCapacities {
         let capacity = capacity.max(1);
         self.app_server = capacity;
         self.event_stream = capacity;
-    }
-}
-
-#[derive(Debug, Clone, Copy, Default)]
-struct PromptContextOptions {
-    include_permissions_instructions: Option<bool>,
-    include_apps_instructions: Option<bool>,
-    include_collaboration_mode_instructions: Option<bool>,
-    include_environment_context: Option<bool>,
-    include_skill_instructions: Option<bool>,
-}
-
-impl PromptContextOptions {
-    fn minimal() -> Self {
-        Self {
-            include_permissions_instructions: Some(false),
-            include_apps_instructions: Some(false),
-            include_collaboration_mode_instructions: Some(false),
-            include_environment_context: Some(false),
-            include_skill_instructions: Some(false),
-        }
-    }
-
-    fn apply_to(self, config: &mut Config) {
-        if let Some(enabled) = self.include_permissions_instructions {
-            config.include_permissions_instructions = enabled;
-        }
-        if let Some(enabled) = self.include_apps_instructions {
-            config.include_apps_instructions = enabled;
-        }
-        if let Some(enabled) = self.include_collaboration_mode_instructions {
-            config.include_collaboration_mode_instructions = enabled;
-        }
-        if let Some(enabled) = self.include_environment_context {
-            config.include_environment_context = enabled;
-        }
-        if let Some(enabled) = self.include_skill_instructions {
-            config.include_skill_instructions = enabled;
-        }
     }
 }
 
@@ -525,12 +494,12 @@ pub struct CodexBuilder {
     base_instructions: Option<String>,
     /// Native developer instructions added for all threads created by this runtime.
     developer_instructions: Option<String>,
-    /// Optional model-visible prompt context controls.
-    prompt_context: PromptContextOptions,
-    /// Default approval policy for new threads and turns.
-    approval_policy: AskForApproval,
-    /// Default sandbox for new threads.
-    sandbox: SandboxMode,
+    /// Ordered native changes applied to every new thread's defaults.
+    thread_defaults: ThreadDefaultsOverrides,
+    /// Explicit approval-policy override for new threads and turns.
+    approval_policy: Option<AskForApproval>,
+    /// Explicit sandbox override for new threads.
+    sandbox: Option<SandboxMode>,
     /// Whether new threads are ephemeral by default.
     ephemeral: bool,
 }
@@ -549,9 +518,9 @@ impl Default for CodexBuilder {
             personality: None,
             base_instructions: None,
             developer_instructions: None,
-            prompt_context: PromptContextOptions::default(),
-            approval_policy: AskForApproval::OnRequest,
-            sandbox: SandboxMode::WorkspaceWrite,
+            thread_defaults: ThreadDefaultsOverrides::default(),
+            approval_policy: None,
+            sandbox: None,
             ephemeral: true,
         }
     }
@@ -641,49 +610,110 @@ impl CodexBuilder {
     /// This keeps the base instructions and tool schemas, but disables permissions,
     /// apps, collaboration mode, environment context, and skill instruction blocks.
     pub fn minimal_prompt_context(mut self) -> Self {
-        self.prompt_context = PromptContextOptions::minimal();
+        self.thread_defaults.minimize_prompt_context();
+        self
+    }
+
+    /// Disable the configurable tool families used by a normal Codex agent.
+    ///
+    /// This applies native per-thread overrides for:
+    ///
+    /// - apps, plugins, install recommendations, and orchestrator-owned skills/MCP;
+    /// - shell/code-mode, multi-agent/fanout, image generation, memories, and goals;
+    /// - deferred-environment, permission-request, token-budget, time, user-input,
+    ///   and web-search tools.
+    ///
+    /// This is a best-effort minimal tool profile, not an all-tools-off policy.
+    /// Core tools such as `update_plan` can remain model-visible. User-configured
+    /// MCP servers, dynamic tools, environment-dependent tools, and future tool
+    /// families are also unaffected.
+    /// Call [`Self::default_thread_config_overrides`] afterwards to re-enable or
+    /// further customize individual native settings.
+    pub fn minimal_tools(mut self) -> Self {
+        self.thread_defaults.minimize_tools();
+        self
+    }
+
+    /// Configure new threads for a small-token, chat-oriented session.
+    ///
+    /// This disables optional prompt context, project-document discovery, known
+    /// configurable tool families, and environment access. It remains a
+    /// best-effort profile: core, user MCP, dynamic, and future tools can still
+    /// be model-visible.
+    pub fn pure_chat_profile(mut self) -> Self {
+        self.thread_defaults.configure_pure_chat();
+        self
+    }
+
+    /// Select the default execution-environment behavior for new threads.
+    pub fn default_environment_access(mut self, access: EnvironmentAccess) -> Self {
+        self.thread_defaults.set_environment_access(access);
         self
     }
 
     /// Choose whether to include permission/sandbox guidance in model context.
     pub fn include_permissions_instructions(mut self, enabled: bool) -> Self {
-        self.prompt_context.include_permissions_instructions = Some(enabled);
+        self.thread_defaults
+            .set_prompt_context(INCLUDE_PERMISSIONS_INSTRUCTIONS_CONFIG_KEY, enabled);
         self
     }
 
     /// Choose whether to include app/connector guidance in model context.
     pub fn include_apps_instructions(mut self, enabled: bool) -> Self {
-        self.prompt_context.include_apps_instructions = Some(enabled);
+        self.thread_defaults
+            .set_prompt_context(INCLUDE_APPS_INSTRUCTIONS_CONFIG_KEY, enabled);
         self
     }
 
     /// Choose whether to include collaboration-mode guidance in model context.
     pub fn include_collaboration_mode_instructions(mut self, enabled: bool) -> Self {
-        self.prompt_context.include_collaboration_mode_instructions = Some(enabled);
+        self.thread_defaults.set_prompt_context(
+            INCLUDE_COLLABORATION_MODE_INSTRUCTIONS_CONFIG_KEY,
+            enabled,
+        );
         self
     }
 
     /// Choose whether to include environment metadata in model context.
     pub fn include_environment_context(mut self, enabled: bool) -> Self {
-        self.prompt_context.include_environment_context = Some(enabled);
+        self.thread_defaults
+            .set_prompt_context(INCLUDE_ENVIRONMENT_CONTEXT_CONFIG_KEY, enabled);
         self
     }
 
     /// Choose whether to include available skill instructions in model context.
     pub fn include_skill_instructions(mut self, enabled: bool) -> Self {
-        self.prompt_context.include_skill_instructions = Some(enabled);
+        self.thread_defaults
+            .set_prompt_context(INCLUDE_SKILL_INSTRUCTIONS_CONFIG_KEY, enabled);
         self
     }
 
-    /// Set the default approval policy for new threads and turns.
+    /// Merge native config overrides into every new thread's defaults.
+    ///
+    /// Keys use the dotted paths accepted by `thread/start.config`. Prefer the
+    /// typed setters above for common values; use this for current Codex fields
+    /// that intentionally have no high-level SDK setter.
+    pub fn default_thread_config_overrides(
+        mut self,
+        overrides: HashMap<String, serde_json::Value>,
+    ) -> Self {
+        self.thread_defaults.merge_config(overrides);
+        self
+    }
+
+    /// Explicitly override the approval policy for new threads and turns.
+    ///
+    /// Without this call, native Codex config and trust defaults are preserved.
     pub fn default_approval_policy(mut self, approval_policy: AskForApproval) -> Self {
-        self.approval_policy = approval_policy;
+        self.approval_policy = Some(approval_policy);
         self
     }
 
-    /// Set the default sandbox for new threads.
+    /// Explicitly override the sandbox for new threads.
+    ///
+    /// Without this call, native Codex config and trust defaults are preserved.
     pub fn default_sandbox(mut self, sandbox: SandboxMode) -> Self {
-        self.sandbox = sandbox;
+        self.sandbox = Some(sandbox);
         self
     }
 
@@ -738,6 +768,7 @@ impl CodexBuilder {
     pub async fn start(self) -> Result<Codex> {
         let mut runtime = self.runtime;
         let arg0_paths = runtime.take_arg0_paths()?;
+        let thread_defaults = self.thread_defaults;
         let cwd = match self.cwd {
             Some(cwd) => cwd,
             None => std::env::current_dir()?,
@@ -755,7 +786,6 @@ impl CodexBuilder {
                 personality: self.personality,
                 base_instructions: self.base_instructions,
                 developer_instructions: self.developer_instructions,
-                prompt_context: self.prompt_context,
                 approval_policy: self.approval_policy,
                 sandbox: self.sandbox,
                 ephemeral: self.ephemeral,
@@ -763,20 +793,24 @@ impl CodexBuilder {
         )
         .await?;
 
-        start_with_config_and_paths(config, runtime, arg0_paths).await
+        start_with_config_and_paths(config, runtime, arg0_paths, thread_defaults).await
     }
 }
 
 /// Builder for starting the SDK from a caller-supplied native Codex config.
 ///
-/// This builder intentionally exposes only runtime options that are not already
-/// represented by [`Config`].
+/// Common effective thread defaults are projected from [`Config`]. The embedded
+/// app-server still reloads file and project layers for each thread, so this
+/// builder also exposes native default thread params/config overrides for values
+/// that exist only as in-memory mutations on a resolved config.
 #[derive(Debug, Clone)]
 pub struct CodexWithConfigBuilder {
     /// Fully resolved native Codex configuration.
     config: Config,
     /// Runtime startup options that are not part of Codex config.
     runtime: RuntimeOptions,
+    /// Ordered native changes applied to the resolved config snapshot.
+    thread_defaults: ThreadDefaultsOverrides,
 }
 
 impl CodexWithConfigBuilder {
@@ -784,6 +818,7 @@ impl CodexWithConfigBuilder {
         Self {
             config,
             runtime: RuntimeOptions::default(),
+            thread_defaults: ThreadDefaultsOverrides::default(),
         }
     }
 
@@ -834,9 +869,66 @@ impl CodexWithConfigBuilder {
         self
     }
 
+    /// Replace the native defaults copied into new thread builders.
+    ///
+    /// The embedded app-server reloads file and project configuration for each
+    /// thread. Common resolved values are projected from [`Config`] automatically,
+    /// but callers that mutate other thread-scoped config fields in memory should
+    /// carry them explicitly through [`ThreadStartParams::config`] here.
+    pub fn default_thread_params(mut self, params: ThreadStartParams) -> Self {
+        self.thread_defaults.replace(params);
+        self
+    }
+
+    /// Disable optional model-visible context blocks for small-token sessions.
+    pub fn minimal_prompt_context(mut self) -> Self {
+        self.thread_defaults.minimize_prompt_context();
+        self
+    }
+
+    /// Disable the configurable tool families used by a normal Codex agent.
+    ///
+    /// This applies the same best-effort native per-thread tool profile as
+    /// [`CodexBuilder::minimal_tools`]. It does not guarantee an empty tool list;
+    /// core, user MCP, dynamic, environment-dependent, and future tools can
+    /// remain model-visible.
+    pub fn minimal_tools(mut self) -> Self {
+        self.thread_defaults.minimize_tools();
+        self
+    }
+
+    /// Configure new threads for a small-token, chat-oriented session.
+    ///
+    /// This applies the same prompt, project-document, tool, and environment
+    /// defaults as [`CodexBuilder::pure_chat_profile`].
+    pub fn pure_chat_profile(mut self) -> Self {
+        self.thread_defaults.configure_pure_chat();
+        self
+    }
+
+    /// Select the default execution-environment behavior for new threads.
+    pub fn default_environment_access(mut self, access: EnvironmentAccess) -> Self {
+        self.thread_defaults.set_environment_access(access);
+        self
+    }
+
+    /// Merge native config overrides into every new thread's defaults.
+    ///
+    /// Keys use the same dotted paths accepted by `thread/start.config`, for
+    /// example `features.plugins` or `web_search`. This is the preferred
+    /// escape hatch for thread-scoped values that cannot be reconstructed from
+    /// a fully resolved [`Config`].
+    pub fn default_thread_config_overrides(
+        mut self,
+        overrides: HashMap<String, serde_json::Value>,
+    ) -> Self {
+        self.thread_defaults.merge_config(overrides);
+        self
+    }
+
     /// Start the in-process Codex runtime.
     pub async fn start(self) -> Result<Codex> {
-        start_with_config(self.config, self.runtime).await
+        start_with_config(self.config, self.runtime, self.thread_defaults).await
     }
 }
 
@@ -853,10 +945,8 @@ enum RemoteEndpointConfig {
 
 /// Builder for connecting to an already-running remote Codex app-server.
 ///
-/// Remote mode intentionally exposes only transport and client-identity
-/// options. Model, sandbox, prompt, and other Codex config defaults belong to
-/// the remote app-server process; use thread/turn builders or native params for
-/// per-request overrides.
+/// Runtime config belongs to the remote app-server process. This builder only
+/// owns transport/client identity and SDK-side defaults sent with `thread/start`.
 #[derive(Clone)]
 pub struct CodexRemoteBuilder {
     /// Remote app-server endpoint to connect to.
@@ -865,8 +955,8 @@ pub struct CodexRemoteBuilder {
     client_info: ClientInfo,
     /// Independent capacities for the upstream connection and SDK streams.
     channels: ChannelCapacities,
-    /// Native Codex defaults copied into new thread builders.
-    default_thread_params: ThreadStartParams,
+    /// Ordered SDK-side changes applied to new thread defaults.
+    thread_defaults: ThreadDefaultsOverrides,
 }
 
 impl fmt::Debug for CodexRemoteBuilder {
@@ -883,6 +973,7 @@ impl fmt::Debug for CodexRemoteBuilder {
             .field("transport", &transport)
             .field("auth_configured", &auth_configured)
             .field("client_info", &self.client_info)
+            .field("thread_defaults", &self.thread_defaults)
             .field("app_server_channel_capacity", &self.channels.app_server)
             .field("event_stream_capacity", &self.channels.event_stream)
             .finish_non_exhaustive()
@@ -898,7 +989,7 @@ impl CodexRemoteBuilder {
             },
             client_info: ClientInfo::default(),
             channels: ChannelCapacities::default(),
-            default_thread_params: remote_default_thread_params(),
+            thread_defaults: ThreadDefaultsOverrides::default(),
         }
     }
 
@@ -907,7 +998,7 @@ impl CodexRemoteBuilder {
             endpoint: RemoteEndpointConfig::UnixSocket { socket_path },
             client_info: ClientInfo::default(),
             channels: ChannelCapacities::default(),
-            default_thread_params: remote_default_thread_params(),
+            thread_defaults: ThreadDefaultsOverrides::default(),
         }
     }
 
@@ -973,7 +1064,7 @@ impl CodexRemoteBuilder {
     /// These defaults are SDK-side conveniences only. The remote app-server
     /// remains the owner of its runtime config.
     pub fn default_thread_params(mut self, params: ThreadStartParams) -> Self {
-        self.default_thread_params = params;
+        self.thread_defaults.replace(params);
         self
     }
 
@@ -1009,21 +1100,28 @@ impl CodexRemoteBuilder {
         )
         .await?;
 
-        Ok(Codex::from_runtime(runtime, self.default_thread_params))
+        let default_thread_params =
+            self.thread_defaults.apply(remote_default_thread_params());
+        Ok(Codex::from_runtime(runtime, default_thread_params))
     }
 }
 
-async fn start_with_config(config: Config, mut runtime: RuntimeOptions) -> Result<Codex> {
+async fn start_with_config(
+    config: Config,
+    mut runtime: RuntimeOptions,
+    thread_defaults: ThreadDefaultsOverrides,
+) -> Result<Codex> {
     let arg0_paths = runtime.take_arg0_paths()?;
-    start_with_config_and_paths(config, runtime, arg0_paths).await
+    start_with_config_and_paths(config, runtime, arg0_paths, thread_defaults).await
 }
 
 async fn start_with_config_and_paths(
     config: Config,
     runtime: RuntimeOptions,
     arg0_paths: Arg0DispatchPaths,
+    thread_defaults: ThreadDefaultsOverrides,
 ) -> Result<Codex> {
-    let default_thread_params = default_thread_params_from_config(&config);
+    let default_thread_params = thread_defaults.apply(thread_defaults_snapshot(&config));
     let RuntimeOptions {
         client_info,
         channels,
@@ -1044,22 +1142,6 @@ async fn start_with_config_and_paths(
 fn remote_default_thread_params() -> ThreadStartParams {
     ThreadStartParams {
         ephemeral: Some(true),
-        thread_source: Some(ThreadSource::User),
-        ..Default::default()
-    }
-}
-
-fn default_thread_params_from_config(config: &Config) -> ThreadStartParams {
-    ThreadStartParams {
-        cwd: Some(config.cwd.display().to_string()),
-        model: config.model.clone(),
-        model_provider: Some(config.model_provider_id.clone()),
-        service_tier: config.service_tier.clone().map(Some),
-        approval_policy: Some(AskForApproval::from(
-            config.permissions.approval_policy.value(),
-        )),
-        personality: config.personality,
-        ephemeral: Some(config.ephemeral),
         thread_source: Some(ThreadSource::User),
         ..Default::default()
     }
@@ -1093,9 +1175,8 @@ struct ConfigBuildOptions {
     personality: Option<Personality>,
     base_instructions: Option<String>,
     developer_instructions: Option<String>,
-    prompt_context: PromptContextOptions,
-    approval_policy: AskForApproval,
-    sandbox: SandboxMode,
+    approval_policy: Option<AskForApproval>,
+    sandbox: Option<SandboxMode>,
     ephemeral: bool,
 }
 
@@ -1118,8 +1199,8 @@ async fn build_config(
             base_instructions: options.base_instructions,
             developer_instructions: options.developer_instructions,
             personality: options.personality,
-            approval_policy: Some(options.approval_policy.to_core()),
-            sandbox_mode: Some(options.sandbox.to_core()),
+            approval_policy: options.approval_policy.map(AskForApproval::to_core),
+            sandbox_mode: options.sandbox.map(SandboxMode::to_core),
             codex_self_exe: arg0_paths.codex_self_exe.clone(),
             codex_linux_sandbox_exe: arg0_paths.codex_linux_sandbox_exe.clone(),
             main_execve_wrapper_exe: arg0_paths.main_execve_wrapper_exe.clone(),
@@ -1130,7 +1211,6 @@ async fn build_config(
         .await
         .map_err(Error::config)?;
 
-    options.prompt_context.apply_to(&mut config);
     if let Some(effort) = options.reasoning_effort {
         config.model_reasoning_effort = Some(effort);
     }
@@ -1168,8 +1248,30 @@ impl IntoFuture for CodexRemoteBuilder {
 }
 
 #[cfg(test)]
-mod debug_tests {
+mod tests {
     use super::*;
+    use crate::thread_defaults::merge_thread_config_overrides;
+
+    fn test_config_build_options(
+        codex_home: &std::path::Path,
+        cwd: &std::path::Path,
+    ) -> ConfigBuildOptions {
+        ConfigBuildOptions {
+            codex_home: Some(codex_home.to_path_buf()),
+            cwd: cwd.to_path_buf(),
+            model: None,
+            model_provider: None,
+            service_tier: None,
+            reasoning_effort: None,
+            reasoning_summary: None,
+            personality: None,
+            base_instructions: None,
+            developer_instructions: None,
+            approval_policy: None,
+            sandbox: None,
+            ephemeral: true,
+        }
+    }
 
     #[test]
     fn remote_builder_debug_redacts_endpoint_and_auth_token() {
@@ -1182,6 +1284,120 @@ mod debug_tests {
         assert!(debug.contains("auth_configured: true"));
         assert!(!debug.contains("url-secret"));
         assert!(!debug.contains("bearer-secret"));
+    }
+
+    #[test]
+    fn builder_debug_redacts_native_thread_config_values() {
+        let builder =
+            Codex::builder().default_thread_config_overrides(HashMap::from([(
+                "example.token".to_string(),
+                serde_json::Value::String("thread-secret".to_string()),
+            )]));
+
+        let debug = format!("{builder:?}");
+        assert!(debug.contains("MergeConfig"));
+        assert!(debug.contains("count: 1"));
+        assert!(!debug.contains("thread-secret"));
+    }
+
+    #[test]
+    fn minimal_tools_sets_documented_native_overrides() {
+        let builder = Codex::builder().minimal_tools();
+        let params = builder.thread_defaults.apply(ThreadStartParams::default());
+        let overrides = params.config.expect("minimal tool config");
+
+        for key in [
+            "features.apps",
+            "features.plugins",
+            "features.shell_tool",
+            "features.multi_agent",
+            "features.image_generation",
+            "features.memories",
+            "features.goals",
+            "orchestrator.skills.enabled",
+            "orchestrator.mcp.enabled",
+            "tools.experimental_request_user_input.enabled",
+        ] {
+            assert_eq!(
+                overrides.get(key),
+                Some(&serde_json::Value::Bool(false)),
+                "unexpected override for {key}"
+            );
+        }
+        assert_eq!(
+            overrides.get("web_search"),
+            Some(&serde_json::Value::String("disabled".to_string()))
+        );
+        assert_eq!(params.environments, None);
+    }
+
+    #[test]
+    fn later_native_overrides_can_customize_minimal_tools() {
+        let builder = Codex::builder()
+            .minimal_tools()
+            .default_thread_config_overrides(HashMap::from([(
+                "features.image_generation".to_string(),
+                serde_json::Value::Bool(true),
+            )]));
+
+        let params = builder.thread_defaults.apply(ThreadStartParams::default());
+        assert_eq!(
+            params
+                .config
+                .as_ref()
+                .and_then(|config| config.get("features.image_generation")),
+            Some(&serde_json::Value::Bool(true))
+        );
+    }
+
+    #[test]
+    fn pure_chat_profile_disables_prompt_context_project_docs_tools_and_environment() {
+        let builder = Codex::builder().pure_chat_profile();
+        let params = builder.thread_defaults.apply(ThreadStartParams::default());
+
+        assert_eq!(params.environments, Some(Vec::new()));
+        let config = params.config.expect("pure chat config");
+        assert_eq!(
+            config.get("include_apps_instructions"),
+            Some(&serde_json::Value::Bool(false))
+        );
+        assert_eq!(
+            config.get("features.plugins"),
+            Some(&serde_json::Value::Bool(false))
+        );
+        assert_eq!(
+            config.get("project_doc_max_bytes"),
+            Some(&serde_json::Value::from(0))
+        );
+    }
+
+    #[test]
+    fn later_builder_calls_can_customize_the_pure_chat_profile() {
+        let builder = Codex::builder()
+            .pure_chat_profile()
+            .include_apps_instructions(true)
+            .default_thread_config_overrides(HashMap::from([(
+                "project_doc_max_bytes".to_string(),
+                serde_json::Value::from(1024),
+            )]))
+            .default_environment_access(EnvironmentAccess::Inherit);
+        let params = builder.thread_defaults.apply(ThreadStartParams::default());
+
+        assert_eq!(params.environments, None);
+        assert_eq!(
+            params
+                .config
+                .as_ref()
+                .and_then(|config| config.get("include_apps_instructions")),
+            Some(&serde_json::Value::Bool(true))
+        );
+        assert_eq!(
+            params
+                .config
+                .as_ref()
+                .and_then(|config| config.get("project_doc_max_bytes")),
+            Some(&serde_json::Value::from(1024))
+        );
     }
 
     #[test]
@@ -1202,5 +1418,127 @@ mod debug_tests {
 
         assert_eq!(builder.runtime.channels.app_server, 128);
         assert_eq!(builder.runtime.channels.event_stream, 16);
+    }
+
+    #[test]
+    fn explicit_thread_config_overrides_replace_derived_values() {
+        let mut params = ThreadStartParams {
+            config: Some(HashMap::from([(
+                "features.plugins".to_string(),
+                serde_json::Value::Bool(true),
+            )])),
+            ..Default::default()
+        };
+
+        merge_thread_config_overrides(
+            &mut params,
+            HashMap::from([
+                (
+                    "features.plugins".to_string(),
+                    serde_json::Value::Bool(false),
+                ),
+                (
+                    "project_doc_max_bytes".to_string(),
+                    serde_json::Value::from(0),
+                ),
+            ]),
+        );
+
+        let config = params.config.expect("merged config");
+        assert_eq!(
+            config.get("features.plugins"),
+            Some(&serde_json::Value::Bool(false))
+        );
+        assert_eq!(
+            config.get("project_doc_max_bytes"),
+            Some(&serde_json::Value::from(0))
+        );
+    }
+
+    #[tokio::test]
+    async fn native_sandbox_and_approval_are_inherited_without_builder_overrides() {
+        let codex_home = tempfile::tempdir().expect("create temp CODEX_HOME");
+        let cwd = tempfile::tempdir().expect("create temp cwd");
+        std::fs::write(
+            codex_home.path().join("config.toml"),
+            "approval_policy = \"never\"\nsandbox_mode = \"read-only\"\n",
+        )
+        .expect("write native config");
+
+        let config = build_config(
+            &Arg0DispatchPaths::default(),
+            test_config_build_options(codex_home.path(), cwd.path()),
+        )
+        .await
+        .expect("build test config");
+        let params = thread_defaults_snapshot(&config);
+
+        assert_eq!(params.approval_policy, Some(AskForApproval::Never));
+        assert_eq!(params.sandbox, Some(SandboxMode::ReadOnly));
+    }
+
+    #[tokio::test]
+    async fn runtime_defaults_are_forwarded_to_native_thread_params() {
+        let codex_home = tempfile::tempdir().expect("create temp CODEX_HOME");
+        let cwd = tempfile::tempdir().expect("create temp cwd");
+        std::fs::write(
+            codex_home.path().join("config.toml"),
+            "approval_policy = \"on-request\"\nsandbox_mode = \"workspace-write\"\n",
+        )
+        .expect("write native config");
+        let mut options = test_config_build_options(codex_home.path(), cwd.path());
+        options.service_tier = Some(None);
+        options.reasoning_effort = Some(ReasoningEffort::High);
+        options.reasoning_summary = Some(ReasoningSummary::Detailed);
+        options.base_instructions = Some("test base".to_string());
+        options.developer_instructions = Some("test developer".to_string());
+        options.approval_policy = Some(AskForApproval::Never);
+        options.sandbox = Some(SandboxMode::ReadOnly);
+        let mut config = build_config(&Arg0DispatchPaths::default(), options)
+            .await
+            .expect("build test config");
+
+        config.include_permissions_instructions = false;
+        config.include_apps_instructions = false;
+        config.include_collaboration_mode_instructions = false;
+        config.include_environment_context = false;
+        config.include_skill_instructions = false;
+
+        let params = thread_defaults_snapshot(&config);
+        // Codex normalizes an explicit clear to its wire-level `default` tier.
+        assert_eq!(params.service_tier, Some(Some("default".to_string())));
+        assert_eq!(params.sandbox, Some(SandboxMode::ReadOnly));
+        assert_eq!(params.approval_policy, Some(AskForApproval::Never));
+        assert_eq!(params.base_instructions.as_deref(), Some("test base"));
+        assert_eq!(
+            params.developer_instructions.as_deref(),
+            Some("test developer")
+        );
+
+        let overrides = params.config.expect("thread config overrides");
+        assert_eq!(overrides.len(), 7);
+        for key in [
+            "include_permissions_instructions",
+            "include_apps_instructions",
+            "include_collaboration_mode_instructions",
+            "include_environment_context",
+            "skills.include_instructions",
+        ] {
+            assert_eq!(overrides.get(key), Some(&serde_json::Value::Bool(false)));
+        }
+        assert_eq!(
+            overrides.get("model_reasoning_effort"),
+            Some(&serde_json::Value::String("high".to_string()))
+        );
+        assert_eq!(
+            overrides.get("model_reasoning_summary"),
+            Some(&serde_json::Value::String("detailed".to_string()))
+        );
+
+        // A caller-supplied resolved Config can also represent a direct clear;
+        // keep that distinct from an omitted thread override.
+        config.service_tier = None;
+        let cleared = thread_defaults_snapshot(&config);
+        assert_eq!(cleared.service_tier, Some(None));
     }
 }

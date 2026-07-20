@@ -10,6 +10,7 @@ use crate::client::Codex;
 use crate::error::{Error, Result};
 use crate::runtime::RuntimeHandle;
 use crate::thread::Thread;
+use crate::thread_defaults::EnvironmentAccess;
 use crate::types::{TurnId, cwd_to_string};
 
 /// Converts common SDK input shapes into native Codex turn input items.
@@ -85,6 +86,13 @@ impl CodexTurnBuilder {
         let cwd = cwd.into();
         self.thread_params.cwd = Some(cwd_to_string(&cwd));
         self.turn_params.cwd = Some(cwd);
+        self
+    }
+
+    /// Select the execution environment for the temporary thread and turn.
+    pub fn environment_access(mut self, access: EnvironmentAccess) -> Self {
+        access.clone().apply_to_thread(&mut self.thread_params);
+        access.apply_to_turn(&mut self.turn_params);
         self
     }
 
@@ -320,6 +328,12 @@ impl TurnBuilder {
     /// Set the working directory for this turn.
     pub fn cwd(mut self, cwd: impl Into<std::path::PathBuf>) -> Self {
         self.params.cwd = Some(cwd.into());
+        self
+    }
+
+    /// Select the execution environment for this turn and subsequent turns.
+    pub fn environment_access(mut self, access: EnvironmentAccess) -> Self {
+        access.apply_to_turn(&mut self.params);
         self
     }
 

@@ -179,17 +179,27 @@ through `CodexEventStream`, rather than being copied into every thread stream.
 In-process mode loads and resolves Codex config in the local process.
 `Codex::builder()` exposes the common SDK-facing options and constructs the
 internal app-server start config for you. Use `Codex::builder_with_config(config)`
-only when your application already owns native Codex config resolution.
+only when your application already owns native Codex config resolution. Because
+the embedded app-server reloads file/project layers for each new thread, the SDK
+also projects effective model, sandbox/permissions, reasoning, instructions, and
+prompt-context defaults into `thread/start`. For other in-memory, thread-scoped
+config mutations, use `default_thread_config_overrides(...)` or exact native
+`default_thread_params(...)` on `CodexWithConfigBuilder`.
+Sandbox and approval policy are inherited from native Codex config and trust
+defaults unless the corresponding SDK setters are called explicitly.
 
 Remote mode treats the app-server as the configuration owner. The Rust SDK
-builder only configures the transport and client identity; use thread and turn
-builders for per-request overrides.
+builder configures transport/client identity and can copy complete native
+`ThreadStartParams` into new thread builders; it does not reproduce or mutate
+the remote runtime's config.
 
-For low-token or pure chat sessions, in-process builders can use
-`minimal_prompt_context()` to disable optional Codex context instructions.
-`base_instructions(...)`, `developer_instructions(...)`,
-`reasoning_effort(...)`, and `reasoning_summary(...)` are available as runtime
-defaults. Prompt instructions can be overridden when creating a thread or a
+For low-token or pure chat sessions, use `pure_chat_profile()` on an in-process
+runtime builder. It disables optional prompt context, project-document loading,
+known configurable tools, and environment access while keeping later builder
+calls authoritative. The in-process builder also exposes `base_instructions(...)`,
+`developer_instructions(...)`, `reasoning_effort(...)`, and
+`reasoning_summary(...)` as runtime defaults. Prompt instructions can be
+overridden when creating a thread or a
 temporary-thread turn, while reasoning settings can also change on existing
 thread turns. See the
 [pure chatbot configuration](docs/sdk-user-guide.md#pure-chatbot-configuration)
