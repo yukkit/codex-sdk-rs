@@ -249,6 +249,64 @@ For finer control, use `include_permissions_instructions(false)`,
 are code-layer overrides on `CodexBuilder`; when using
 `builder_with_config(config)`, edit the supplied native `Config` directly.
 
+### Pure Chatbot Configuration
+
+Codex can also host a conversational assistant that is not intended to work on
+code. Replace the native Codex base instructions with the chatbot's role and
+disable the optional coding-oriented context blocks:
+
+```rust,no_run
+let codex = ctx
+    .builder()
+    // Keep user configuration and project instructions out of this runtime.
+    .codex_home("/srv/my-chatbot/codex-home")
+    .cwd("/srv/my-chatbot/workdir")
+    .base_instructions(
+        "You are a friendly customer-support assistant. \
+         Answer from the conversation and do not perform software-development tasks.",
+    )
+    .developer_instructions(
+        "Keep answers concise. Ask one clarifying question when the request is ambiguous.",
+    )
+    .minimal_prompt_context()
+    .default_sandbox(SandboxMode::ReadOnly)
+    .ephemeral(true)
+    .start()
+    .await?;
+
+let thread = codex.thread().start().await?;
+let mut events = thread.event_stream()?;
+
+let _turn = thread.turn("How do I change my delivery address?").start().await?;
+// Consume `events` until this turn emits `TurnCompleted` before starting the
+// customer's next turn. Keep the same thread to preserve chat history.
+```
+
+`base_instructions(...)` replaces, rather than appends to, the model-specific
+Codex base prompt. Passing an empty string removes that base prompt entirely,
+but a chatbot normally supplies its own role as shown above. Base and developer
+instructions belong to the thread configuration: set them on `CodexBuilder` as
+defaults, on `ThreadBuilder` before creating a reusable thread, or on
+`CodexTurnBuilder` when creating a one-turn temporary thread. A later
+`turn/start` on an existing thread cannot replace its base instructions.
+
+`minimal_prompt_context()` disables permission, app, collaboration-mode,
+environment, and skill instruction blocks. It deliberately does not remove:
+
+- conversation history or the current user message;
+- tool schemas exposed by Codex;
+- `AGENTS.md` discovered from the configured working directory;
+- enabled MCP servers, plugins, memories, or other extension-provided context.
+
+For a predictable chat-only deployment, use a dedicated `codex_home` without
+unneeded MCP/plugin/memory configuration and a dedicated `cwd` without project
+instructions; both directories must already exist. `SandboxMode::ReadOnly`
+limits filesystem mutation, but neither it nor prompt text is a hard
+tool-disable policy. The current high-level SDK
+does not provide an all-tools-off switch; applications that must guarantee that
+no Codex tools are exposed need native configuration/tool-policy support or a
+direct model API intended for tool-free chat.
+
 If your application already resolved a native `codex_core::config::Config`
 through Codex's own loader, pass it directly to the SDK with
 `ctx.builder_with_config(config)` instead of mapping it through an SDK-specific
@@ -870,6 +928,75 @@ let _observability = Observability::builder()
     .runtime_metrics(true)
     .install()?;
 ```
+
+### Inspect Model-Visible Requests
+
+OpenTelemetry spans are not a request-body capture: they do not contain the
+complete request Codex assembled for the model. When debugging prompt assembly,
+tool exposure, or conversation history, enable Codex's local rollout trace
+before starting the process that hosts the Codex runtime:
+
+```sh
+mkdir -p /tmp/codex-rollout-traces
+CODEX_ROLLOUT_TRACE_ROOT=/tmp/codex-rollout-traces \
+  cargo run --example minimal
+```
+
+For a remote SDK client, set `CODEX_ROLLOUT_TRACE_ROOT` on the remote app-server
+process, not on the client. Each independent root thread creates a
+`trace-<trace-id>-<thread-id>` bundle containing `manifest.json`, `trace.jsonl`,
+and referenced JSON files under `payloads/`.
+
+List every model inference attempt and its request payload:
+
+```sh
+bundle="$(ls -dt /tmp/codex-rollout-traces/trace-* | head -n 1)"
+jq -r '
+  select(.payload.type == "inference_started")
+  | [.payload.codex_turn_id, .payload.inference_call_id,
+     .payload.request_payload.path]
+  | @tsv
+' "$bundle/trace.jsonl"
+```
+
+For example, inspect the most recent inference attempt:
+
+```sh
+request_path="$(
+  jq -r '
+    select(.payload.type == "inference_started")
+    | .payload.request_payload.path
+  ' "$bundle/trace.jsonl" | tail -n 1
+)"
+jq . "$bundle/$request_path"
+```
+
+The payload shows the model-visible request, including fields such as the model,
+instructions, conversation input, tools, reasoning settings, and text/output
+configuration. Retries and transport fallback can create more than one
+`inference_started` event for a turn, so inspect the matching inference attempt
+rather than assuming there is only one request.
+
+This is semantic request capture, not a raw network capture. For the normal HTTP
+transport it is usually the exact provider request. When WebSocket reuse omits
+already-sent input, the trace can instead store the complete logical request the
+model sees, rather than the incremental bytes sent on that WebSocket message.
+It does not capture authentication headers or compressed wire bytes.
+
+Rollout traces are separate from OTel and are never uploaded by Codex. They are
+also highly sensitive: a bundle can contain prompts, responses, tool
+inputs/outputs, terminal output, and local paths. Do not write bundles into the
+repository or enable them broadly in production; restrict access and remove
+them when the investigation is complete.
+
+For a reduced semantic graph in addition to the raw payloads, run:
+
+```sh
+codex debug trace-reduce "$bundle"
+```
+
+This writes `state.json` inside the bundle; the original inference requests
+remain in `payloads/`.
 
 ## MCP And Skills
 

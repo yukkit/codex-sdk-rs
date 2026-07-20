@@ -189,7 +189,11 @@ For low-token or pure chat sessions, in-process builders can use
 `minimal_prompt_context()` to disable optional Codex context instructions.
 `base_instructions(...)`, `developer_instructions(...)`,
 `reasoning_effort(...)`, and `reasoning_summary(...)` are available as runtime
-defaults and can still be overridden per turn.
+defaults. Prompt instructions can be overridden when creating a thread or a
+temporary-thread turn, while reasoning settings can also change on existing
+thread turns. See the
+[pure chatbot configuration](docs/sdk-user-guide.md#pure-chatbot-configuration)
+for a complete example and the remaining context/tool boundaries.
 
 ## Observability
 
@@ -206,6 +210,10 @@ let _observability = codex_sdk::Observability::builder()
 
 Use `install_subscriber(false).build_provider()?` when your application already
 owns the global `tracing_subscriber`.
+
+OpenTelemetry spans are not a request-body capture. To inspect the complete
+model-visible inference input locally, use the opt-in
+[rollout trace workflow](docs/sdk-user-guide.md#inspect-model-visible-requests).
 
 ## Documentation
 
