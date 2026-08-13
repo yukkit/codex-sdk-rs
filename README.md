@@ -1,3 +1,5 @@
+
+
 # codex-sdk-rs
 
 Rust SDK for using Codex app-server runtimes from server-side applications.
@@ -37,6 +39,8 @@ anyhow = "1"
 tokio = { version = "1", features = ["macros", "rt-multi-thread"] }
 tokio-stream = "0.1"
 ```
+
+(anyhow, tokio, and tokio-stream are only required for the examples)
 
 The Cargo package name is `codex-sdk-rs`; the Rust import name is `codex_sdk`.
 
