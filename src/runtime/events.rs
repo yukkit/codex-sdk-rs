@@ -302,10 +302,10 @@ impl EventRouter {
         let thread_id = parse_thread_id(thread_id)?;
         self.close_thread(
             thread_id,
-            AppServerEvent::ServerNotification(ServerNotification::ThreadArchived(
-                ThreadArchivedNotification {
+            AppServerEvent::ServerNotification(Box::new(
+                ServerNotification::ThreadArchived(ThreadArchivedNotification {
                     thread_id: thread_id.to_string(),
-                },
+                }),
             )),
             TerminalSource::Authoritative,
         );
@@ -682,7 +682,8 @@ impl ThreadRoute {
     fn enqueue(&mut self, event: AppServerEvent) -> Option<ActiveEvent> {
         let unarchive_boundary = matches!(
             &event,
-            AppServerEvent::ServerNotification(ServerNotification::ThreadUnarchived(_))
+            AppServerEvent::ServerNotification(notification)
+                if matches!(notification.as_ref(), ServerNotification::ThreadUnarchived(_))
         );
         match self {
             Self::Pending(pending) => {
@@ -717,7 +718,8 @@ impl ThreadRoute {
     fn close_thread(self, event: AppServerEvent, source: TerminalSource) -> Self {
         let is_archive = matches!(
             &event,
-            AppServerEvent::ServerNotification(ServerNotification::ThreadArchived(_))
+            AppServerEvent::ServerNotification(notification)
+                if matches!(notification.as_ref(), ServerNotification::ThreadArchived(_))
         );
         match self {
             Self::Pending(mut pending) | Self::Closed(mut pending) => {
@@ -767,15 +769,17 @@ impl ThreadRoute {
 }
 
 fn event_requires_delivery(event: &AppServerEvent) -> bool {
-    // Mirrors codex-app-server-client rust-v0.144.4 for transcript and
-    // completion notifications. The SDK additionally keeps ServerRequest and
-    // Lagged reliable because callers must observe and act on them.
+    // Preserve transcript events and notifications guaranteed by the embedded server.
     match event {
         AppServerEvent::ServerRequest(_) | AppServerEvent::Lagged { .. } => true,
         AppServerEvent::ServerNotification(notification) => matches!(
-            notification,
+            notification.as_ref(),
             ServerNotification::TurnCompleted(_)
+                | ServerNotification::ThreadQueueChanged(_)
+                | ServerNotification::ThreadAttachmentUpdated(_)
                 | ServerNotification::ThreadSettingsUpdated(_)
+                | ServerNotification::ProcessOutputDelta(_)
+                | ServerNotification::ProcessExited(_)
                 | ServerNotification::ItemCompleted(_)
                 | ServerNotification::ExternalAgentConfigImportCompleted(_)
                 | ServerNotification::AgentMessageDelta(_)
@@ -783,14 +787,16 @@ fn event_requires_delivery(event: &AppServerEvent) -> bool {
                 | ServerNotification::ReasoningSummaryTextDelta(_)
                 | ServerNotification::ReasoningTextDelta(_)
         ),
-        AppServerEvent::Disconnected { .. } => true,
+        AppServerEvent::ThreadStreamDisconnected(_)
+        | AppServerEvent::ThreadStreamReconnected(_)
+        | AppServerEvent::Disconnected { .. } => true,
     }
 }
 
 fn thread_event_terminates_stream(event: &AppServerEvent) -> bool {
     matches!(
         event,
-        AppServerEvent::ServerNotification(
+        AppServerEvent::ServerNotification(notification) if matches!(notification.as_ref(),
             ServerNotification::ThreadArchived(_)
                 | ServerNotification::ThreadDeleted(_)
                 | ServerNotification::ThreadClosed(_)
@@ -807,9 +813,10 @@ fn parse_thread_id(thread_id: &str) -> Result<ThreadId> {
 #[cfg(test)]
 mod tests {
     use codex_app_server_protocol::{
-        ServerNotification, ThreadArchivedNotification, ThreadClosedNotification,
-        ThreadDeletedNotification, ThreadUnarchivedNotification, Turn,
-        TurnCompletedNotification, TurnItemsView, TurnStatus, WarningNotification,
+        ErrorNotification, ServerNotification, ThreadArchivedNotification,
+        ThreadClosedNotification, ThreadDeletedNotification,
+        ThreadUnarchivedNotification, Turn, TurnCompletedNotification, TurnError,
+        TurnItemsView, TurnStatus, WarningNotification,
     };
 
     use super::*;
@@ -852,6 +859,51 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn thread_reply_recovery_is_scoped_and_keeps_the_thread_open() {
+        let router = EventRouter::new(CAPACITY);
+        let thread_id = ThreadId::new();
+        let mut thread = router
+            .take_thread(&thread_id.to_string())
+            .expect("thread stream");
+        let mut runtime = router.take_runtime().expect("runtime stream");
+
+        router
+            .route(AppServerEvent::ThreadStreamDisconnected(Box::new(
+                ErrorNotification {
+                    thread_id: thread_id.to_string(),
+                    turn_id: "active".to_string(),
+                    will_retry: false,
+                    error: TurnError {
+                        message: "reply stream closed".to_string(),
+                        codex_error_info: None,
+                        additional_details: None,
+                        misalignment: None,
+                    },
+                },
+            )))
+            .await;
+        assert!(matches!(
+            thread.try_recv(),
+            Ok(AppServerEvent::ThreadStreamDisconnected(_))
+        ));
+        assert!(matches!(runtime.try_recv(), Err(TryRecvError::Empty)));
+
+        router
+            .route(AppServerEvent::ThreadStreamReconnected(
+                thread_id.to_string(),
+            ))
+            .await;
+        assert!(matches!(
+            thread.try_recv(),
+            Ok(AppServerEvent::ThreadStreamReconnected(_))
+        ));
+        assert!(matches!(runtime.try_recv(), Err(TryRecvError::Empty)));
+
+        router.route(turn_completed(&thread_id, "active")).await;
+        assert_eq!(turn_id(thread.recv().await).as_deref(), Some("active"));
+    }
+
+    #[tokio::test]
     async fn thread_close_is_delivered_before_the_route_ends() {
         let router = EventRouter::new(CAPACITY);
         let thread_id = ThreadId::new();
@@ -860,18 +912,16 @@ mod tests {
             .expect("thread should attach");
 
         router
-            .route(AppServerEvent::ServerNotification(
-                ServerNotification::ThreadClosed(ThreadClosedNotification {
+            .route(notification_event(ServerNotification::ThreadClosed(
+                ThreadClosedNotification {
                     thread_id: thread_id.to_string(),
-                }),
-            ))
+                },
+            )))
             .await;
 
         assert!(matches!(
-            receiver.recv().await,
-            Some(AppServerEvent::ServerNotification(
-                ServerNotification::ThreadClosed(_)
-            ))
+            notification(receiver.recv().await),
+            Some(ServerNotification::ThreadClosed(_))
         ));
         assert!(receiver.recv().await.is_none());
     }
@@ -888,10 +938,8 @@ mod tests {
         router.route(thread_archived(&thread_id)).await;
 
         assert!(matches!(
-            receiver.recv().await,
-            Some(AppServerEvent::ServerNotification(
-                ServerNotification::ThreadArchived(_)
-            ))
+            notification(receiver.recv().await),
+            Some(ServerNotification::ThreadArchived(_))
         ));
         assert!(receiver.recv().await.is_none());
         router
@@ -902,13 +950,11 @@ mod tests {
     #[test]
     fn delete_is_a_terminal_thread_event() {
         let thread_id = ThreadId::new();
-        assert!(thread_event_terminates_stream(
-            &AppServerEvent::ServerNotification(ServerNotification::ThreadDeleted(
-                ThreadDeletedNotification {
-                    thread_id: thread_id.to_string(),
-                },
-            ))
-        ));
+        assert!(thread_event_terminates_stream(&notification_event(
+            ServerNotification::ThreadDeleted(ThreadDeletedNotification {
+                thread_id: thread_id.to_string(),
+            },)
+        )));
     }
 
     #[tokio::test]
@@ -921,20 +967,18 @@ mod tests {
 
         router.route(thread_archived(&thread_id)).await;
         router
-            .route(AppServerEvent::ServerNotification(
-                ServerNotification::ThreadUnarchived(ThreadUnarchivedNotification {
+            .route(notification_event(ServerNotification::ThreadUnarchived(
+                ThreadUnarchivedNotification {
                     thread_id: thread_id.to_string(),
-                }),
-            ))
+                },
+            )))
             .await;
         let mut receiver = reservation.claim().expect("reservation should attach");
         router.route(turn_completed(&thread_id, "fresh")).await;
 
         assert!(matches!(
-            receiver.recv().await,
-            Some(AppServerEvent::ServerNotification(
-                ServerNotification::ThreadUnarchived(_)
-            ))
+            notification(receiver.recv().await),
+            Some(ServerNotification::ThreadUnarchived(_))
         ));
         assert_eq!(turn_id(receiver.recv().await).as_deref(), Some("fresh"));
     }
@@ -950,19 +994,17 @@ mod tests {
 
         router.route(thread_archived(&thread_id)).await;
         router
-            .route(AppServerEvent::ServerNotification(
-                ServerNotification::ThreadUnarchived(ThreadUnarchivedNotification {
+            .route(notification_event(ServerNotification::ThreadUnarchived(
+                ThreadUnarchivedNotification {
                     thread_id: thread_id.to_string(),
-                }),
-            ))
+                },
+            )))
             .await;
         router.route(turn_completed(&thread_id, "fresh")).await;
 
         assert!(matches!(
-            receiver.recv().await,
-            Some(AppServerEvent::ServerNotification(
-                ServerNotification::ThreadUnarchived(_)
-            ))
+            notification(receiver.recv().await),
+            Some(ServerNotification::ThreadUnarchived(_))
         ));
         assert_eq!(turn_id(receiver.recv().await).as_deref(), Some("fresh"));
     }
@@ -981,10 +1023,8 @@ mod tests {
         router.route(thread_archived(&thread_id)).await;
 
         assert!(matches!(
-            receiver.recv().await,
-            Some(AppServerEvent::ServerNotification(
-                ServerNotification::ThreadArchived(_)
-            ))
+            notification(receiver.recv().await),
+            Some(ServerNotification::ThreadArchived(_))
         ));
         assert!(receiver.recv().await.is_none());
     }
@@ -1004,10 +1044,8 @@ mod tests {
 
         assert_eq!(turn_id(receiver.recv().await).as_deref(), Some("queued"));
         assert!(matches!(
-            receiver.recv().await,
-            Some(AppServerEvent::ServerNotification(
-                ServerNotification::ThreadArchived(_)
-            ))
+            notification(receiver.recv().await),
+            Some(ServerNotification::ThreadArchived(_))
         ));
         assert!(receiver.recv().await.is_none());
     }
@@ -1025,10 +1063,8 @@ mod tests {
             .expect("new archive should establish a terminal boundary");
 
         assert!(matches!(
-            receiver.recv().await,
-            Some(AppServerEvent::ServerNotification(
-                ServerNotification::ThreadArchived(_)
-            ))
+            notification(receiver.recv().await),
+            Some(ServerNotification::ThreadArchived(_))
         ));
         assert!(receiver.recv().await.is_none());
     }
@@ -1039,11 +1075,11 @@ mod tests {
         let thread_id = ThreadId::new();
 
         router
-            .route(AppServerEvent::ServerNotification(
-                ServerNotification::ThreadClosed(ThreadClosedNotification {
+            .route(notification_event(ServerNotification::ThreadClosed(
+                ThreadClosedNotification {
                     thread_id: thread_id.to_string(),
-                }),
-            ))
+                },
+            )))
             .await;
 
         assert!(!router.state().threads.contains_key(&thread_id));
@@ -1055,11 +1091,11 @@ mod tests {
         let thread_id = ThreadId::new();
         router.route(turn_completed(&thread_id, "pending")).await;
         router
-            .route(AppServerEvent::ServerNotification(
-                ServerNotification::ThreadClosed(ThreadClosedNotification {
+            .route(notification_event(ServerNotification::ThreadClosed(
+                ThreadClosedNotification {
                     thread_id: thread_id.to_string(),
-                }),
-            ))
+                },
+            )))
             .await;
 
         let mut receiver = router
@@ -1067,10 +1103,8 @@ mod tests {
             .expect("pending route should remain claimable");
         assert_eq!(turn_id(receiver.recv().await).as_deref(), Some("pending"));
         assert!(matches!(
-            receiver.recv().await,
-            Some(AppServerEvent::ServerNotification(
-                ServerNotification::ThreadClosed(_)
-            ))
+            notification(receiver.recv().await),
+            Some(ServerNotification::ThreadClosed(_))
         ));
         assert!(receiver.recv().await.is_none());
     }
@@ -1113,19 +1147,17 @@ mod tests {
             .expect("thread should attach");
 
         router
-            .route(AppServerEvent::ServerNotification(
-                ServerNotification::Warning(WarningNotification {
+            .route(notification_event(ServerNotification::Warning(
+                WarningNotification {
                     thread_id: None,
                     message: "runtime warning".to_string(),
-                }),
-            ))
+                },
+            )))
             .await;
 
         assert!(matches!(
-            runtime.recv().await,
-            Some(AppServerEvent::ServerNotification(
-                ServerNotification::Warning(_)
-            ))
+            notification(runtime.recv().await),
+            Some(ServerNotification::Warning(_))
         ));
         assert!(matches!(thread.try_recv(), Err(TryRecvError::Empty)));
     }
@@ -1219,12 +1251,12 @@ mod tests {
         drop(runtime);
 
         router
-            .route(AppServerEvent::ServerNotification(
-                ServerNotification::Warning(WarningNotification {
+            .route(notification_event(ServerNotification::Warning(
+                WarningNotification {
                     thread_id: None,
                     message: "after drop".to_string(),
-                }),
-            ))
+                },
+            )))
             .await;
 
         assert!(matches!(
@@ -1267,11 +1299,11 @@ mod tests {
             .expect("first thread stream should attach");
 
         router
-            .route(AppServerEvent::ServerNotification(
-                ServerNotification::ThreadClosed(ThreadClosedNotification {
+            .route(notification_event(ServerNotification::ThreadClosed(
+                ThreadClosedNotification {
                     thread_id: thread_id_string.clone(),
-                }),
-            ))
+                },
+            )))
             .await;
         assert!(first.recv().await.is_some());
         assert!(first.recv().await.is_none());
@@ -1309,10 +1341,8 @@ mod tests {
         };
 
         assert!(matches!(
-            receiver.recv().await,
-            Some(AppServerEvent::ServerNotification(
-                ServerNotification::Warning(_)
-            ))
+            notification(receiver.recv().await),
+            Some(ServerNotification::Warning(_))
         ));
         assert!(matches!(
             receiver.recv().await,
@@ -1322,17 +1352,26 @@ mod tests {
         routing.await.expect("routing task should finish");
     }
 
+    fn notification_event(notification: ServerNotification) -> AppServerEvent {
+        AppServerEvent::ServerNotification(Box::new(notification))
+    }
+
+    fn notification(event: Option<AppServerEvent>) -> Option<ServerNotification> {
+        match event? {
+            AppServerEvent::ServerNotification(notification) => Some(*notification),
+            _ => None,
+        }
+    }
+
     fn thread_warning(thread_id: &ThreadId, message: &str) -> AppServerEvent {
-        AppServerEvent::ServerNotification(ServerNotification::Warning(
-            WarningNotification {
-                thread_id: Some(thread_id.to_string()),
-                message: message.to_string(),
-            },
-        ))
+        notification_event(ServerNotification::Warning(WarningNotification {
+            thread_id: Some(thread_id.to_string()),
+            message: message.to_string(),
+        }))
     }
 
     fn thread_archived(thread_id: &ThreadId) -> AppServerEvent {
-        AppServerEvent::ServerNotification(ServerNotification::ThreadArchived(
+        notification_event(ServerNotification::ThreadArchived(
             ThreadArchivedNotification {
                 thread_id: thread_id.to_string(),
             },
@@ -1340,11 +1379,12 @@ mod tests {
     }
 
     fn turn_completed(thread_id: &ThreadId, turn_id: &str) -> AppServerEvent {
-        AppServerEvent::ServerNotification(ServerNotification::TurnCompleted(
+        notification_event(ServerNotification::TurnCompleted(
             TurnCompletedNotification {
                 thread_id: thread_id.to_string(),
                 turn: Turn {
                     id: turn_id.to_string(),
+                    root_turn_id: None,
                     items: Vec::new(),
                     items_view: TurnItemsView::Full,
                     status: TurnStatus::Completed,
@@ -1358,10 +1398,7 @@ mod tests {
     }
 
     fn turn_id(event: Option<AppServerEvent>) -> Option<String> {
-        let AppServerEvent::ServerNotification(ServerNotification::TurnCompleted(
-            completed,
-        )) = event?
-        else {
+        let ServerNotification::TurnCompleted(completed) = notification(event)? else {
             return None;
         };
         Some(completed.turn.id)

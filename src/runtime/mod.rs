@@ -7,9 +7,9 @@ use std::sync::Arc;
 use app_server::{AppServerDriver, AppServerHandle};
 use codex_app_server_client::{
     AppServerClient, AppServerEvent, DEFAULT_IN_PROCESS_CHANNEL_CAPACITY,
-    EnvironmentManager, ExecServerRuntimePaths, InProcessAppServerClient,
-    InProcessClientStartArgs, RemoteAppServerClient, RemoteAppServerConnectArgs,
-    StateDbHandle,
+    EmbeddedNetworkPolicy, EnvironmentManager, ExecServerRuntimeOptions,
+    InProcessAppServerClient, InProcessClientStartArgs, RemoteAppServerClient,
+    RemoteAppServerConnectArgs, StateDbHandle,
 };
 use codex_app_server_protocol::{
     ClientRequest, ConfigWarningNotification, RequestId, Result as JsonRpcResult,
@@ -45,7 +45,7 @@ struct RuntimeShutdown {
 impl RuntimeHandle {
     pub(crate) async fn start(
         arg0_paths: Arg0DispatchPaths,
-        config: Config,
+        mut config: Config,
         client_info: ClientInfo,
         app_server_channel_capacity: usize,
         event_stream_capacity: usize,
@@ -58,26 +58,34 @@ impl RuntimeHandle {
             "starting Codex in-process runtime"
         );
 
-        let runtime_paths = ExecServerRuntimePaths::from_optional_paths(
+        let runtime_paths = ExecServerRuntimeOptions::from_optional_paths(
             arg0_paths.codex_self_exe.clone(),
             arg0_paths.codex_linux_sandbox_exe.clone(),
         )
         .map_err(Error::runtime_start)?;
+        #[cfg(target_os = "macos")]
+        let runtime_paths = runtime_paths.with_allowed_symlinked_codex_home(
+            codex_config::allowed_symlinked_codex_home(
+                &config.config_layer_stack,
+                &config.codex_home,
+            ),
+        );
+        let embedded_network_policy = EmbeddedNetworkPolicy::default();
+        embedded_network_policy.activate(&mut config);
         let environment_manager = EnvironmentManager::from_codex_home(
-            config.codex_home.to_path_buf(),
+            &config.codex_home,
             Some(runtime_paths),
+            config.http_client_factory(),
         )
         .await
         .map_err(Error::runtime_start)?;
         let state_db = codex_core::init_state_db(&config).await;
-        let config_warnings = config_warnings(&config);
-
         let start_args = sdk_in_process_client_start_args(
             arg0_paths,
             config,
             state_db,
+            embedded_network_policy,
             environment_manager,
-            config_warnings,
             client_info,
             app_server_channel_capacity,
         );
@@ -230,19 +238,22 @@ fn sdk_in_process_client_start_args(
     arg0_paths: Arg0DispatchPaths,
     config: Config,
     state_db: Option<StateDbHandle>,
+    embedded_network_policy: EmbeddedNetworkPolicy,
     environment_manager: EnvironmentManager,
-    config_warnings: Vec<ConfigWarningNotification>,
     client_info: ClientInfo,
     app_server_channel_capacity: usize,
 ) -> InProcessClientStartArgs {
     let client_name = client_info.name;
+    let config_warnings = config_warnings(&config);
     InProcessClientStartArgs {
+        required_human_approval: false,
         arg0_paths,
         config: Arc::new(config),
         cli_overrides: Vec::new(),
         loader_overrides: Default::default(),
         strict_config: false,
         cloud_config_bundle: Default::default(),
+        embedded_network_policy,
         feedback: CodexFeedback::new(),
         log_db: None,
         state_db,

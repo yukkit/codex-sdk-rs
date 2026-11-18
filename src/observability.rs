@@ -3,6 +3,7 @@ use std::fmt;
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicBool, Ordering};
 
+use codex_http_client::{HttpClientFactory, OutboundProxyPolicy};
 pub use codex_otel::{
     OtelExporter, OtelHttpProtocol, OtelProvider, OtelSettings, OtelTlsConfig,
     StatsigMetricsSettings, current_span_trace_id, current_span_w3c_trace_context,
@@ -119,6 +120,10 @@ impl Default for ObservabilityBuilder {
     fn default() -> Self {
         Self {
             settings: OtelSettings {
+                http_client_factory: HttpClientFactory::new(
+                    OutboundProxyPolicy::ReqwestDefault,
+                ),
+                headers_helper: None,
                 environment: "development".to_string(),
                 service_name: "codex-sdk-rs".to_string(),
                 service_version: env!("CARGO_PKG_VERSION").to_string(),
@@ -128,7 +133,7 @@ impl Default for ObservabilityBuilder {
                 trace_exporter: OtelExporter::None,
                 metrics_exporter: OtelExporter::None,
                 runtime_metrics: false,
-                span_attributes: BTreeMap::new(),
+                span_attributes: HashMap::new(),
                 tracestate: BTreeMap::new(),
             },
             env_filter: Some("info".to_string()),
@@ -342,14 +347,14 @@ impl ObservabilityBuilder {
 
     /// Build the OpenTelemetry provider without installing a subscriber.
     pub fn build_provider(self) -> Result<ObservabilityGuard> {
-        let provider = OtelProvider::from(&self.settings)
+        let provider = OtelProvider::try_new(&self.settings)
             .map_err(|error| Error::observability_message(error.to_string()))?;
         Ok(ObservabilityGuard::new(provider))
     }
 
     /// Build the provider and install the configured tracing subscriber.
     pub fn install(self) -> Result<ObservabilityGuard> {
-        let provider = OtelProvider::from(&self.settings)
+        let provider = OtelProvider::try_new(&self.settings)
             .map_err(|error| Error::observability_message(error.to_string()))?;
         if self.install_subscriber {
             install_subscriber(provider.as_ref(), self.env_filter, self.fmt_layer)?;

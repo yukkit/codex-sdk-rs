@@ -371,8 +371,9 @@ Field notes:
 - `ephemeral`: whether sessions are ephemeral by default.
 - `channel_capacity`: convenience setting for both the upstream app-server
   queues and each SDK event-stream queue.
-- `app_server_channel_capacity`: independently sizes upstream transport event
-  and command queues.
+- `app_server_channel_capacity`: sizes upstream client command queues and, in
+  embedded mode, the runtime transport queues. The upstream client buffers
+  events without a capacity limit.
 - `event_stream_capacity`: independently sizes each live SDK event queue.
   Transcript, completion, and `ServerRequest` events apply backpressure;
   best-effort progress events may be replaced by a `Lagged` marker. These
@@ -688,8 +689,8 @@ let first = thread
 while let Some(event) = events.next().await {
     if matches!(
         event,
-        AppServerEvent::ServerNotification(ServerNotification::TurnCompleted(ref done))
-            if done.turn.id == first.turn_id()
+        AppServerEvent::ServerNotification(notification)
+            if matches!(notification.as_ref(), ServerNotification::TurnCompleted(done) if done.turn.id == first.turn_id())
     ) {
         break;
     }
@@ -723,7 +724,8 @@ forked.archive().await?;
 while let Some(event) = forked_events.next().await {
     if matches!(
         event,
-        AppServerEvent::ServerNotification(ServerNotification::ThreadArchived(_))
+        AppServerEvent::ServerNotification(notification)
+            if matches!(notification.as_ref(), ServerNotification::ThreadArchived(_))
     ) {
         break;
     }
@@ -800,17 +802,16 @@ let turn_id = turn.turn_id().to_string();
 
 while let Some(event) = StreamExt::next(&mut stream).await {
     match event {
-        AppServerEvent::ServerNotification(
-            ServerNotification::AgentMessageDelta(delta),
-        ) if delta.turn_id == turn_id => {
-            print!("{}", delta.delta);
-        }
-        AppServerEvent::ServerNotification(
-            ServerNotification::TurnCompleted(done),
-        ) if done.turn.id == turn_id => {
-            eprintln!("turn completed: {:?}", done.turn.status);
-            break;
-        }
+        AppServerEvent::ServerNotification(notification) => match *notification {
+            ServerNotification::AgentMessageDelta(delta) if delta.turn_id == turn_id => {
+                print!("{}", delta.delta);
+            }
+            ServerNotification::TurnCompleted(done) if done.turn.id == turn_id => {
+                eprintln!("turn completed: {:?}", done.turn.status);
+                break;
+            }
+            _ => {}
+        },
         AppServerEvent::ServerRequest(request) => {
             // Show this to the user, then resolve or reject it.
             stream
@@ -837,8 +838,8 @@ turn.steer("Stop after 10 numbers.").await?;
 while let Some(event) = StreamExt::next(&mut stream).await {
     if matches!(
         event,
-        AppServerEvent::ServerNotification(ServerNotification::TurnCompleted(ref done))
-            if done.turn.id == turn.turn_id()
+        AppServerEvent::ServerNotification(notification)
+            if matches!(notification.as_ref(), ServerNotification::TurnCompleted(done) if done.turn.id == turn.turn_id())
     ) {
         break;
     }
@@ -850,9 +851,12 @@ while let Some(event) = StreamExt::next(&mut stream).await {
 
 Common events:
 
-- `ServerNotification`: native Codex app-server notifications, such as
+- `ServerNotification`: boxed native Codex app-server notifications, such as
   `AgentMessageDelta`, `TurnCompleted`, `Error`, token usage, and so on.
-- `ServerRequest`: requests that the application needs to answer.
+- `ServerRequest`: boxed native requests that the application needs to answer.
+- `ThreadStreamDisconnected`: the upstream reply stream closed for a single thread.
+  The underlying turn can still be running.
+- `ThreadStreamReconnected`: the upstream worker resumed listening to that thread.
 - `Lagged`: the upstream source, bounded pre-attachment buffer, or a full live
   event queue skipped best-effort messages.
 - `Disconnected`: the runtime connection closed.
@@ -1054,13 +1058,14 @@ let mut events = turn.thread().event_stream()?;
 
 let mut response = String::new();
 while let Some(event) = events.next().await {
-    match event {
-        AppServerEvent::ServerNotification(
-            ServerNotification::AgentMessageDelta(delta),
-        ) if delta.turn_id == turn_id => response.push_str(&delta.delta),
-        AppServerEvent::ServerNotification(ServerNotification::TurnCompleted(done))
-            if done.turn.id == turn_id => break,
-        _ => {}
+    if let AppServerEvent::ServerNotification(notification) = event {
+        match *notification {
+            ServerNotification::AgentMessageDelta(delta) if delta.turn_id == turn_id => {
+                response.push_str(&delta.delta);
+            }
+            ServerNotification::TurnCompleted(done) if done.turn.id == turn_id => break,
+            _ => {}
+        }
     }
 }
 let summary: ReviewSummary = serde_json::from_str(&response)?;

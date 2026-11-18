@@ -16,6 +16,8 @@ use crate::error::{Error, Result};
 const SERVER_RESPONSE_TIMEOUT: Duration = Duration::from_secs(30);
 const SERVER_RESPONSE_QUEUE_CAPACITY: usize = 32;
 const SHUTDOWN_TIMEOUT: Duration = Duration::from_secs(10);
+// The embedded client can spend up to 45 seconds each on shutdown and task join.
+const IN_PROCESS_SHUTDOWN_TIMEOUT: Duration = Duration::from_secs(95);
 
 /// Operations that do not require mutable access to the event source. The full
 /// `AppServerClient` remains exclusively owned by the driver.
@@ -68,9 +70,6 @@ impl AppServerDriver {
         loop {
             tokio::select! {
                 Some(response) = self.responses.recv() => {
-                    // The pinned upstream client does not expose a split server-
-                    // response handle, so this write temporarily owns the event
-                    // source. Its end-to-end deadline bounds that pause.
                     self.handle_response(response).await;
                 }
                 event = self.client.next_event() => return event,
@@ -84,12 +83,15 @@ impl AppServerDriver {
         // shutdown. Dropping the receiver closes queued and pending sends.
         drop(responses);
 
-        match tokio::time::timeout(SHUTDOWN_TIMEOUT, client.shutdown()).await {
+        let timeout = if matches!(client, AppServerClient::InProcess(_)) {
+            IN_PROCESS_SHUTDOWN_TIMEOUT
+        } else {
+            SHUTDOWN_TIMEOUT
+        };
+        match tokio::time::timeout(timeout, client.shutdown()).await {
             Ok(Ok(())) => Ok(()),
             Ok(Err(error)) => Err(Error::runtime_shutdown(error)),
-            Err(_) => Err(Error::RuntimeShutdownTimeout {
-                timeout: SHUTDOWN_TIMEOUT,
-            }),
+            Err(_) => Err(Error::RuntimeShutdownTimeout { timeout }),
         }
     }
 

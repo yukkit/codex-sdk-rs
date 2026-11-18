@@ -63,22 +63,25 @@ pub async fn wait_for_turn_started(
 ) -> anyhow::Result<()> {
     while let Some(event) = stream.next().await {
         match event {
-            AppServerEvent::ServerNotification(ServerNotification::TurnStarted(
-                started,
-            )) if started.turn.id == turn_id => {
-                return Ok(());
-            }
-            AppServerEvent::ServerNotification(ServerNotification::TurnCompleted(
-                completed,
-            )) if completed.turn.id == turn_id => {
-                bail!("turn {turn_id} completed before it could be controlled");
-            }
-            AppServerEvent::ServerNotification(ServerNotification::Error(error)) => {
-                eprintln!("Codex error event: {error:?}");
-            }
+            AppServerEvent::ServerNotification(notification) => match *notification {
+                ServerNotification::TurnStarted(started)
+                    if started.turn.id == turn_id =>
+                {
+                    return Ok(());
+                }
+                ServerNotification::TurnCompleted(completed)
+                    if completed.turn.id == turn_id =>
+                {
+                    bail!("turn {turn_id} completed before it could be controlled");
+                }
+                ServerNotification::Error(error) => {
+                    eprintln!("Codex error event: {error:?}")
+                }
+                _ => {}
+            },
             AppServerEvent::ServerRequest(request) => {
                 eprintln!("server request {}: {request:?}", request.id());
-                resolve_server_request(stream, request, request_policy).await?;
+                resolve_server_request(stream, *request, request_policy).await?;
             }
             AppServerEvent::Lagged { skipped } => {
                 eprintln!("event stream lagged; skipped {skipped} best-effort events");
@@ -86,7 +89,8 @@ pub async fn wait_for_turn_started(
             AppServerEvent::Disconnected { message } => {
                 bail!("Codex disconnected while turn {turn_id} was starting: {message}");
             }
-            _ => {}
+            AppServerEvent::ThreadStreamDisconnected(_)
+            | AppServerEvent::ThreadStreamReconnected(_) => {}
         }
     }
 
@@ -103,45 +107,47 @@ async fn consume_turn_inner(
 
     while let Some(event) = stream.next().await {
         match event {
-            AppServerEvent::ServerNotification(
-                ServerNotification::AgentMessageDelta(delta),
-            ) if delta.turn_id == turn_id => {
-                if print_deltas {
-                    print!("{}", delta.delta);
+            AppServerEvent::ServerNotification(notification) => match *notification {
+                ServerNotification::AgentMessageDelta(delta)
+                    if delta.turn_id == turn_id =>
+                {
+                    if print_deltas {
+                        print!("{}", delta.delta);
+                    }
+                    response.push_str(&delta.delta);
                 }
-                response.push_str(&delta.delta);
-            }
-            AppServerEvent::ServerNotification(ServerNotification::TurnCompleted(
-                done,
-            )) if done.turn.id == turn_id => {
-                if print_deltas {
-                    println!();
+                ServerNotification::TurnCompleted(done) if done.turn.id == turn_id => {
+                    if print_deltas {
+                        println!();
+                    }
+                    eprintln!(
+                        "turn {turn_id} completed with status {:?}",
+                        done.turn.status
+                    );
+                    if done.turn.status
+                        == codex_app_server_protocol::TurnStatus::Completed
+                    {
+                        return Ok(response);
+                    }
+                    let error = done
+                        .turn
+                        .error
+                        .as_ref()
+                        .map(|error| error.message.as_str())
+                        .unwrap_or("no turn error was provided");
+                    bail!(
+                        "turn {turn_id} ended with status {:?}: {error}",
+                        done.turn.status
+                    );
                 }
-                let status = serde_json::to_value(&done.turn.status)?;
-                eprintln!(
-                    "turn {turn_id} completed with status {:?}",
-                    done.turn.status
-                );
-                if status == "completed" {
-                    return Ok(response);
+                ServerNotification::Error(error) => {
+                    eprintln!("Codex error event: {error:?}");
                 }
-                let error = done
-                    .turn
-                    .error
-                    .as_ref()
-                    .map(|error| error.message.as_str())
-                    .unwrap_or("no turn error was provided");
-                bail!(
-                    "turn {turn_id} ended with status {:?}: {error}",
-                    done.turn.status
-                );
-            }
-            AppServerEvent::ServerNotification(ServerNotification::Error(error)) => {
-                eprintln!("Codex error event: {error:?}");
-            }
+                _ => {}
+            },
             AppServerEvent::ServerRequest(request) => {
                 eprintln!("server request {}: {request:?}", request.id());
-                resolve_server_request(stream, request, request_policy).await?;
+                resolve_server_request(stream, *request, request_policy).await?;
             }
             AppServerEvent::Lagged { skipped } => {
                 eprintln!("event stream lagged; skipped {skipped} best-effort events");
@@ -149,7 +155,8 @@ async fn consume_turn_inner(
             AppServerEvent::Disconnected { message } => {
                 bail!("Codex disconnected while turn {turn_id} was active: {message}");
             }
-            _ => {}
+            AppServerEvent::ThreadStreamDisconnected(_)
+            | AppServerEvent::ThreadStreamReconnected(_) => {}
         }
     }
 
@@ -162,9 +169,8 @@ pub async fn wait_for_archive(
 ) -> anyhow::Result<()> {
     while let Some(event) = stream.next().await {
         match event {
-            AppServerEvent::ServerNotification(ServerNotification::ThreadArchived(
-                archived,
-            )) if archived.thread_id == thread_id => {
+            AppServerEvent::ServerNotification(notification) if matches!(notification.as_ref(), ServerNotification::ThreadArchived(archived) if archived.thread_id == thread_id) =>
+            {
                 return Ok(());
             }
             AppServerEvent::Lagged { skipped } => {
@@ -186,17 +192,15 @@ pub async fn wait_for_compaction(
 ) -> anyhow::Result<()> {
     while let Some(event) = stream.next().await {
         match event {
-            AppServerEvent::ServerNotification(ServerNotification::ItemCompleted(
-                completed,
-            )) if completed.thread_id == thread_id
-                && serde_json::to_value(&completed.item)?["type"]
-                    == "contextCompaction" =>
-            {
-                return Ok(());
-            }
-            AppServerEvent::ServerNotification(ServerNotification::Error(error)) => {
-                eprintln!("Codex error event: {error:?}");
-            }
+            AppServerEvent::ServerNotification(notification) => match *notification {
+                ServerNotification::ItemCompleted(completed)
+                    if completed.thread_id == thread_id
+                        && matches!(completed.item.payload, codex_app_server_protocol::ThreadItemPayload::ContextCompaction { .. }) => {
+                    return Ok(());
+                }
+                ServerNotification::Error(error) => eprintln!("Codex error event: {error:?}"),
+                _ => {}
+            },
             AppServerEvent::Lagged { skipped } => {
                 eprintln!("compaction stream lagged; skipped {skipped} events");
             }

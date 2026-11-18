@@ -23,11 +23,15 @@ codex-arg0 = { git = "https://github.com/openai/codex", tag = "rust-vX.Y.Z", pac
 codex-config = { git = "https://github.com/openai/codex", tag = "rust-vX.Y.Z", package = "codex-config" }
 codex-core = { git = "https://github.com/openai/codex", tag = "rust-vX.Y.Z", package = "codex-core" }
 codex-feedback = { git = "https://github.com/openai/codex", tag = "rust-vX.Y.Z", package = "codex-feedback" }
+codex-features = { git = "https://github.com/openai/codex", tag = "rust-vX.Y.Z", package = "codex-features" }
+codex-http-client = { git = "https://github.com/openai/codex", tag = "rust-vX.Y.Z", package = "codex-http-client" }
 codex-otel = { git = "https://github.com/openai/codex", tag = "rust-vX.Y.Z", package = "codex-otel" }
 codex-protocol = { git = "https://github.com/openai/codex", tag = "rust-vX.Y.Z", package = "codex-protocol" }
+codex-utils-absolute-path = { git = "https://github.com/openai/codex", tag = "rust-vX.Y.Z", package = "codex-utils-absolute-path" }
 ```
 
-Then refresh the lockfile:
+Match the required upstream Cargo patches in the SDK workspace root. Downstream
+workspaces must mirror those patches. Then refresh the lockfile:
 
 ```sh
 cargo update
@@ -44,11 +48,11 @@ cargo check
 Expected compile failures are useful signals. In particular:
 
 - `ServerNotification` match failures usually mean
-  `src/event.rs::notification_matches` needs a new routing rule.
+  `src/event.rs::notification_target` needs a new routing rule.
 - `ServerRequest` match failures usually mean
-  `src/event.rs::request_matches` needs a new routing rule.
-- `AppServerEvent` / `InProcessServerEvent` failures usually mean
-  `src/runtime/mod.rs::spawn_event_loop` needs updates.
+  `src/event.rs::request_target` needs a new routing rule.
+- `AppServerEvent` failures usually mean `src/event.rs::event_target` and
+  `src/runtime/events.rs::event_requires_delivery` need updates.
 
 ## 3. Review Protocol Changes
 
@@ -66,8 +70,8 @@ For every new or changed `ServerNotification`, decide:
 - Is it runtime-scoped and therefore owned by `CodexEventStream`?
 - Does the thread stream need new terminal or routing behavior for it?
 - Must it remain reliable under live-queue backpressure? Keep
-  `src/runtime/events.rs::event_requires_delivery` aligned with upstream
-  `app-server-client` transcript/completion delivery policy.
+  `src/runtime/events.rs::event_requires_delivery` aligned with the upstream
+  embedded server delivery guarantees and preserve SDK transcript delivery.
 
 For `ThreadStartParams` and `TurnStartParams`, decide:
 
@@ -91,7 +95,7 @@ For every new or changed `ServerRequest`, decide:
 Verify these SDK boundary assumptions still hold:
 
 - Each `Thread` should expose one long-lived native `AppServerEvent` stream.
-- `AppServerEvent::ServerRequest` should expose the native `ServerRequest`
+- `AppServerEvent::ServerRequest` should expose the boxed native `ServerRequest`
   directly. Runtime behavior such as resolve/reject belongs on `Codex` or
   `ThreadEventStream`.
 - Thread start/resume/fork/unarchive paths must retain events that arrive before

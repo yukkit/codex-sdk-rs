@@ -358,6 +358,7 @@ impl WarmupBuilder {
                             limit: None,
                             detail: Some(McpServerStatusDetail::ToolsAndAuthOnly),
                             thread_id: None,
+                            server_name: None,
                         },
                     },
                 )

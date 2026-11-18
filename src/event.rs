@@ -15,6 +15,12 @@ pub(crate) fn event_target(event: &AppServerEvent) -> EventTarget {
         AppServerEvent::ServerNotification(notification) => {
             notification_target(notification)
         }
+        AppServerEvent::ThreadStreamDisconnected(error) => {
+            target_from_thread_id(Some(error.thread_id.as_str()))
+        }
+        AppServerEvent::ThreadStreamReconnected(thread_id) => {
+            target_from_thread_id(Some(thread_id.as_str()))
+        }
         AppServerEvent::Lagged { .. } | AppServerEvent::Disconnected { .. } => {
             EventTarget::Runtime
         }
@@ -60,7 +66,21 @@ fn notification_target(notification: &ServerNotification) -> EventTarget {
         ServerNotification::ThreadDeleted(params) => Some(params.thread_id.as_str()),
         ServerNotification::ThreadUnarchived(params) => Some(params.thread_id.as_str()),
         ServerNotification::ThreadClosed(params) => Some(params.thread_id.as_str()),
+        ServerNotification::ThreadReverted(params) => Some(params.thread_id.as_str()),
         ServerNotification::ThreadNameUpdated(params) => Some(params.thread_id.as_str()),
+        ServerNotification::ThreadAttachmentUpdated(params) => {
+            Some(params.thread_id.as_str())
+        }
+        ServerNotification::ThreadProjectUpdated(params) => {
+            Some(params.thread_id.as_str())
+        }
+        ServerNotification::ThreadQueueChanged(params) => Some(params.thread_id.as_str()),
+        ServerNotification::ThreadReadStateChanged(params) => {
+            Some(params.thread_id.as_str())
+        }
+        ServerNotification::ThreadPredictionUpdated(params) => {
+            Some(params.thread_id.as_str())
+        }
         ServerNotification::ThreadGoalUpdated(params) => Some(params.thread_id.as_str()),
         ServerNotification::ThreadGoalCleared(params) => Some(params.thread_id.as_str()),
         ServerNotification::ThreadSettingsUpdated(params) => {
@@ -83,6 +103,12 @@ fn notification_target(notification: &ServerNotification) -> EventTarget {
             Some(params.thread_id.as_str())
         }
         ServerNotification::ItemCompleted(params) => Some(params.thread_id.as_str()),
+        ServerNotification::StrictReviewRequired(params) => {
+            Some(params.thread_id.as_str())
+        }
+        ServerNotification::RawResponseCompleted(params) => {
+            Some(params.thread_id.as_str())
+        }
         ServerNotification::RawResponseItemCompleted(params) => {
             Some(params.thread_id.as_str())
         }
@@ -116,6 +142,10 @@ fn notification_target(notification: &ServerNotification) -> EventTarget {
         ServerNotification::ContextCompacted(params) => Some(params.thread_id.as_str()),
         ServerNotification::ModelRerouted(params) => Some(params.thread_id.as_str()),
         ServerNotification::ModelVerification(params) => Some(params.thread_id.as_str()),
+        ServerNotification::AuthRecoveryStarted(params)
+        | ServerNotification::AuthRecoveryCompleted(params) => {
+            Some(params.thread_id.as_str())
+        }
         ServerNotification::TurnModerationMetadata(params) => {
             Some(params.thread_id.as_str())
         }
@@ -125,10 +155,22 @@ fn notification_target(notification: &ServerNotification) -> EventTarget {
         ServerNotification::Warning(params) => params.thread_id.as_deref(),
         ServerNotification::GuardianWarning(params) => Some(params.thread_id.as_str()),
         ServerNotification::McpServerStatusUpdated(params) => params.thread_id.as_deref(),
+        ServerNotification::McpServerOauthLoginCompleted(params) => {
+            params.thread_id.as_deref()
+        }
         ServerNotification::ThreadRealtimeStarted(params) => {
             Some(params.thread_id.as_str())
         }
         ServerNotification::ThreadRealtimeItemAdded(params) => {
+            Some(params.thread_id.as_str())
+        }
+        ServerNotification::ThreadRealtimeItemStarted(params) => {
+            Some(params.thread_id.as_str())
+        }
+        ServerNotification::ThreadRealtimeItemTranscriptDelta(params) => {
+            Some(params.thread_id.as_str())
+        }
+        ServerNotification::ThreadRealtimeItemCompleted(params) => {
             Some(params.thread_id.as_str())
         }
         ServerNotification::ThreadRealtimeTranscriptDelta(params) => {
@@ -148,7 +190,12 @@ fn notification_target(notification: &ServerNotification) -> EventTarget {
             Some(params.thread_id.as_str())
         }
         ServerNotification::SkillsChanged(_)
-        | ServerNotification::McpServerOauthLoginCompleted(_)
+        | ServerNotification::McpServerEventStream(_)
+        | ServerNotification::GatewayOAuthChanged(_)
+        | ServerNotification::ProjectChanged(_)
+        | ServerNotification::ThreadSectionChanged(_)
+        | ServerNotification::EnvironmentConnected(_)
+        | ServerNotification::EnvironmentDisconnected(_)
         | ServerNotification::AccountUpdated(_)
         | ServerNotification::AccountRateLimitsUpdated(_)
         | ServerNotification::AppListUpdated(_)

@@ -127,18 +127,25 @@ fn required_id(thread_id: Option<String>) -> anyhow::Result<String> {
 async fn print_thread_page(codex: &Codex) -> anyhow::Result<()> {
     let page = codex
         .list_threads_params(ThreadListParams {
+            include_attached_threads: false,
+            current_account_only: false,
             cursor: None,
             limit: Some(10),
+            excluded_thread_ids: None,
             sort_key: None,
             sort_direction: None,
             model_providers: None,
             source_kinds: None,
+            originators: None,
             archived: None,
+            section_id: None,
+            project_id: None,
             cwd: None,
             use_state_db_only: false,
             search_term: None,
             parent_thread_id: None,
             ancestor_thread_id: None,
+            attached_to_thread_id: None,
         })
         .await?;
     println!("threads in first page: {}", page.data.len());

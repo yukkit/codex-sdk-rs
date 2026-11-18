@@ -20,10 +20,23 @@ notifications, requests, lag, and disconnection events.
 
 This crate is an early implementation over Codex's app-server protocol.
 
-- Crate version: `0.1.0`
+- Crate version: `0.2.0`
 - Minimum Rust version: `1.95.0`
-- Upstream Codex Rust crates: `rust-v0.144.4`
+- Upstream Codex Rust crates: `rust-v0.170.0`
 - crates.io publishing: not enabled yet
+
+SDK `0.2.0` follows the upstream boxed `ServerNotification` and `ServerRequest`
+payloads. Match `*notification` or borrow it with `notification.as_ref()`. Match
+transcript item variants through `item.payload`.
+For integrations targeting Codex `0.144.4`, pin this SDK to `v0.1.0`.
+The `codex-0.144.4` branch tracks maintenance of that version.
+
+Before first starting the embedded `0.170.0` runtime against existing data,
+stop the old runtime and back up its Codex home and any separate SQLite home.
+The new runtime migrates `state_5.sqlite` and drops tables used by `0.144.4`.
+Use separate Codex homes and SQLite paths for side-by-side runs, including any
+`sqlite_home` or `CODEX_SQLITE_HOME` override. Restore the pre-upgrade backup
+before rolling back a migrated state directory.
 
 When updating Codex, move all `codex-*` git dependencies together and follow the
 [upgrade checklist](docs/upgrade-checklist.md).
@@ -43,6 +56,9 @@ tokio-stream = "0.1"
 (anyhow, tokio, and tokio-stream are only required for the examples)
 
 The Cargo package name is `codex-sdk-rs`; the Rust import name is `codex_sdk`.
+For SDK 0.2.0, copy both `[patch.*]` sections from this repository's
+[Cargo.toml](Cargo.toml) into your workspace root. Cargo applies patches from the
+root manifest, and Codex needs these SQLite and WebSocket patches.
 
 ## Quick Start
 
@@ -79,14 +95,14 @@ fn main() -> anyhow::Result<()> {
         let turn_id = turn.turn_id().to_string();
 
         while let Some(event) = events.next().await {
-            match event {
-                AppServerEvent::ServerNotification(
-                    ServerNotification::AgentMessageDelta(delta),
-                ) if delta.turn_id == turn_id => print!("{}", delta.delta),
-                AppServerEvent::ServerNotification(
-                    ServerNotification::TurnCompleted(done),
-                ) if done.turn.id == turn_id => break,
-                _ => {}
+            if let AppServerEvent::ServerNotification(notification) = event {
+                match *notification {
+                    ServerNotification::AgentMessageDelta(delta) if delta.turn_id == turn_id => {
+                        print!("{}", delta.delta);
+                    }
+                    ServerNotification::TurnCompleted(done) if done.turn.id == turn_id => break,
+                    _ => {}
+                }
             }
         }
         println!();
@@ -122,8 +138,8 @@ async fn main() -> anyhow::Result<()> {
         println!("{event:?}");
         if matches!(
             event,
-            AppServerEvent::ServerNotification(ServerNotification::TurnCompleted(ref done))
-                if done.turn.id == turn_id
+            AppServerEvent::ServerNotification(notification)
+                if matches!(notification.as_ref(), ServerNotification::TurnCompleted(done) if done.turn.id == turn_id)
         ) {
             break;
         }
@@ -170,7 +186,8 @@ unarchive creates a new `Thread` attachment and stream.
 Consume each active stream continuously. Live queues preserve transcript,
 completion, and `ServerRequest` events with backpressure; progress-style events
 may be skipped under pressure and reported through `Lagged`. Because the event
-pump is shared, one full reliable queue can delay events for other threads.
+pump is shared, one full reliable queue can delay events for other threads
+and let events accumulate in the upstream client's unbounded event buffer.
 
 Do not overlap turns for the same thread ID. Wait for its `TurnCompleted` event
 before starting the next turn; different thread IDs can run concurrently.

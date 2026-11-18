@@ -30,14 +30,20 @@ fn main() -> anyhow::Result<()> {
         let turn_id = turn.turn_id().to_string();
 
         while let Some(event) = events.next().await {
-            match event {
-                AppServerEvent::ServerNotification(
-                    ServerNotification::AgentMessageDelta(delta),
-                ) if delta.turn_id == turn_id => print!("{}", delta.delta),
-                AppServerEvent::ServerNotification(
-                    ServerNotification::TurnCompleted(done),
-                ) if done.turn.id == turn_id => break,
-                _ => {}
+            if let AppServerEvent::ServerNotification(notification) = event {
+                match *notification {
+                    ServerNotification::AgentMessageDelta(delta)
+                        if delta.turn_id == turn_id =>
+                    {
+                        print!("{}", delta.delta)
+                    }
+                    ServerNotification::TurnCompleted(done)
+                        if done.turn.id == turn_id =>
+                    {
+                        break;
+                    }
+                    _ => {}
+                }
             }
         }
         println!();

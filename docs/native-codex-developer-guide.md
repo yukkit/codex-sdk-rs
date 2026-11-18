@@ -371,7 +371,8 @@ Startup flow, roughly:
    `codex_core::config::Config` use `CodexWithConfigBuilder`.
 3. `RuntimeHandle::start` receives an already-resolved native `Config`; it no
    longer owns SDK-specific runtime options.
-4. Build `ExecServerRuntimePaths` and `EnvironmentManager`.
+4. Build `ExecServerRuntimeOptions` and `EnvironmentManager` with the
+   app-server's network policy.
 5. Initialize state storage with `codex_core::init_state_db`.
 6. Build `InProcessClientStartArgs` through `sdk_in_process_client_start_args`,
    keeping SDK-mode defaults such as loader context, feedback, and `log_db`
@@ -471,8 +472,9 @@ maintaining it, pay close attention to:
   form elicitation.
 - `channel_capacity`: convenience setting for both upstream app-server queues
   and each SDK event-stream queue.
-- `app_server_channel_capacity`: independently sizes upstream transport event
-  and command queues.
+- `app_server_channel_capacity`: sizes upstream client command queues and, in
+  embedded mode, the runtime transport queues. The upstream client buffers
+  events without a capacity limit.
 - `event_stream_capacity`: independently sizes each live SDK event queue.
   Reliable transcript/completion/request events backpressure the shared event
   pump; best-effort progress events can produce `Lagged`. These settings do not
@@ -528,8 +530,10 @@ Each thread exposes one long-lived
 `codex_app_server_client::AppServerEvent` stream directly. The shared runtime
 exposes one separate `CodexEventStream` for events without a thread target:
 
-- `AppServerEvent::ServerNotification(codex_app_server_protocol::ServerNotification)`
-- `AppServerEvent::ServerRequest(codex_app_server_protocol::ServerRequest)`
+- `AppServerEvent::ServerNotification(Box<codex_app_server_protocol::ServerNotification>)`
+- `AppServerEvent::ServerRequest(Box<codex_app_server_protocol::ServerRequest>)`
+- `AppServerEvent::ThreadStreamDisconnected(Box<codex_app_server_protocol::ErrorNotification>)`
+- `AppServerEvent::ThreadStreamReconnected(String)`
 - `AppServerEvent::Lagged`
 - `AppServerEvent::Disconnected`
 

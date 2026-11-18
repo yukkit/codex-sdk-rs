@@ -746,10 +746,10 @@ impl CodexBuilder {
         self
     }
 
-    /// Set the upstream app-server client's event and command queue capacity.
+    /// Set the upstream client command and embedded transport queue capacities.
     ///
-    /// Increase this independently when transport bursts are larger than each
-    /// application's desired per-stream buffering.
+    /// The upstream client's event buffer is unbounded. Use
+    /// [`Self::event_stream_capacity`] for the SDK's per-stream queues.
     pub fn app_server_channel_capacity(mut self, capacity: usize) -> Self {
         self.runtime.channels.app_server = capacity.max(1);
         self
@@ -851,10 +851,10 @@ impl CodexWithConfigBuilder {
         self
     }
 
-    /// Set the upstream app-server client's event and command queue capacity.
+    /// Set the upstream client command and embedded transport queue capacities.
     ///
-    /// Increase this independently when transport bursts are larger than each
-    /// application's desired per-stream buffering.
+    /// The upstream client's event buffer is unbounded. Use
+    /// [`Self::event_stream_capacity`] for the SDK's per-stream queues.
     pub fn app_server_channel_capacity(mut self, capacity: usize) -> Self {
         self.runtime.channels.app_server = capacity.max(1);
         self
@@ -1041,10 +1041,10 @@ impl CodexRemoteBuilder {
         self
     }
 
-    /// Set the upstream app-server client's event and command queue capacity.
+    /// Set the upstream remote client's command queue capacity.
     ///
-    /// Increase this independently when transport bursts are larger than each
-    /// application's desired per-stream buffering.
+    /// The upstream client's event buffer is unbounded. Use
+    /// [`Self::event_stream_capacity`] for the SDK's per-stream queues.
     pub fn app_server_channel_capacity(mut self, capacity: usize) -> Self {
         self.channels.app_server = capacity.max(1);
         self
@@ -1088,6 +1088,7 @@ impl CodexRemoteBuilder {
 
         let runtime = RuntimeHandle::connect_remote(
             RemoteAppServerConnectArgs {
+                required_human_approval: false,
                 endpoint,
                 client_name: self.client_info.name,
                 client_version: self.client_info.version,
@@ -1149,18 +1150,25 @@ fn remote_default_thread_params() -> ThreadStartParams {
 
 fn default_thread_list_params() -> ThreadListParams {
     ThreadListParams {
+        include_attached_threads: false,
+        current_account_only: false,
         cursor: None,
         limit: None,
+        excluded_thread_ids: None,
         sort_key: None,
         sort_direction: None,
         model_providers: None,
         source_kinds: None,
+        originators: None,
         archived: None,
+        section_id: None,
+        project_id: None,
         cwd: None,
         use_state_db_only: false,
         search_term: None,
         parent_thread_id: None,
         ancestor_thread_id: None,
+        attached_to_thread_id: None,
     }
 }
 
