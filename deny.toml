@@ -26,6 +26,39 @@ ignore = [
     # 0.26.x is semver-incompatible with the pinned Rama prerelease.
     "RUSTSEC-2026-0118",
     "RUSTSEC-2026-0119",
+
+    # Unmaintained dependencies selected by the current Codex tag through
+    # serde_yaml, zbus 4, i18n-config, and Codex's chrono APIs.
+    "RUSTSEC-2024-0449",
+    "RUSTSEC-2026-0370",
+    "RUSTSEC-2026-0371",
+    "RUSTSEC-2026-0372",
+    "RUSTSEC-2026-0374",
+    "RUSTSEC-2026-0543",
+
+    # The pinned Rama resolver performs DNS lookups and does not parse zone files.
+    "RUSTSEC-2026-0487",
+    "RUSTSEC-2026-0489",
+    "RUSTSEC-2026-0490",
+
+    # Neither hickory-proto nor hickory-resolver enables DNSSEC in this graph.
+    "RUSTSEC-2026-0504",
+    "RUSTSEC-2026-0505",
+    "RUSTSEC-2026-0511",
+    "RUSTSEC-2026-0512",
+    "RUSTSEC-2026-0514",
+    "RUSTSEC-2026-0530",
+    "RUSTSEC-2026-0531",
+    "RUSTSEC-2026-0532",
+    "RUSTSEC-2026-0549",
+    "RUSTSEC-2026-0550",
+    "RUSTSEC-2026-0551",
+
+    # Timing and DNS allocation risks remain in the pinned dependency chains.
+    # Remove each exception once Cargo.lock selects crypto-bigint >=0.7.6 or
+    # hickory-proto >=0.26.2 for its affected dependency chain.
+    { id = "RUSTSEC-2026-0387", reason = "Temporary exception for the crypto-bigint 0.5 dependency of elliptic-curve 0.13 in the pinned Codex release" },
+    { id = "RUSTSEC-2026-0491", reason = "Temporary exception for Hickory 0.25 used by the pinned Rama resolver" },
 ]
 
 [bans]
