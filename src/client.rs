@@ -12,9 +12,9 @@ use codex_app_server_client::{
 use codex_app_server_protocol::{
     AskForApproval, ClientRequest, GetAccountParams, GetAccountResponse, ModelListParams,
     ModelListResponse, RequestId, SandboxMode, ThreadArchiveParams,
-    ThreadArchiveResponse, ThreadForkParams, ThreadForkResponse, ThreadListParams,
-    ThreadListResponse, ThreadResumeParams, ThreadResumeResponse, ThreadSource,
-    ThreadStartParams, ThreadUnarchiveParams, ThreadUnarchiveResponse, TurnStartParams,
+    ThreadArchiveResponse, ThreadForkParams, ThreadListParams, ThreadListResponse,
+    ThreadResumeParams, ThreadSource, ThreadStartParams, ThreadUnarchiveParams,
+    ThreadUnarchiveResponse, TurnStartParams,
 };
 use codex_arg0::Arg0DispatchPaths;
 use codex_core::config::{Config, ConfigBuilder, ConfigOverrides, find_codex_home};
@@ -54,6 +54,16 @@ struct CodexInner {
     runtime: Arc<RuntimeHandle>,
     /// Native Codex defaults copied into new thread builders.
     default_thread_params: ThreadStartParams,
+}
+
+#[derive(serde::Deserialize)]
+struct ThreadHandleResponse {
+    thread: ThreadHandleMetadata,
+}
+
+#[derive(serde::Deserialize)]
+struct ThreadHandleMetadata {
+    id: ThreadId,
 }
 
 #[derive(Debug, Clone, Default)]
@@ -197,6 +207,9 @@ impl Codex {
     }
 
     /// Resume a saved Codex thread using native `thread/resume` params.
+    ///
+    /// Set `params.exclude_turns` to skip returning history when you only need
+    /// the thread handle. On some servers this also skips replaying token usage.
     pub async fn resume_thread_params(
         &self,
         params: ThreadResumeParams,
@@ -205,7 +218,7 @@ impl Codex {
         let reservation = self
             .runtime()
             .prepare_thread_events(&requested_thread_id, ThreadAttachmentKind::Resume)?;
-        let response: ThreadResumeResponse = self
+        let response: ThreadHandleResponse = self
             .request_typed(ClientRequest::ThreadResume {
                 request_id: self.next_request_id(),
                 params,
@@ -236,6 +249,9 @@ impl Codex {
     }
 
     /// Fork a saved Codex thread using native `thread/fork` params.
+    ///
+    /// Set `params.exclude_turns` to skip returning history when you only need
+    /// the thread handle. This can also skip replaying token usage.
     pub async fn fork_thread_params(
         &self,
         mut params: ThreadForkParams,
@@ -244,7 +260,7 @@ impl Codex {
             params.thread_source = Some(ThreadSource::User);
         }
 
-        let response: ThreadForkResponse = self
+        let response: ThreadHandleResponse = self
             .request_typed(ClientRequest::ThreadFork {
                 request_id: self.next_request_id(),
                 params,
@@ -359,14 +375,23 @@ impl Codex {
     /// `request_id` should come from [`ServerRequest::id`](crate::ServerRequest::id).
     /// The expected `result` shape depends on the concrete
     /// [`ServerRequest`](crate::ServerRequest) variant. Passing response types
-    /// from `codex_app_server_protocol` is preferred, and `serde_json::json!`
-    /// values are also accepted for simple cases.
+    /// from `codex_app_server_protocol` is preferred. Use
+    /// [`Self::resolve_server_request_value`] when the result is already JSON.
     pub async fn resolve_server_request(
         &self,
         request_id: RequestId,
         result: impl serde::Serialize,
     ) -> Result<()> {
-        let result = serde_json::to_value(result)?;
+        self.resolve_server_request_value(request_id, serde_json::to_value(result)?)
+            .await
+    }
+
+    /// Resolve a Codex server request by moving an existing JSON result.
+    pub async fn resolve_server_request_value(
+        &self,
+        request_id: RequestId,
+        result: serde_json::Value,
+    ) -> Result<()> {
         self.inner
             .runtime
             .resolve_server_request(request_id, result)
@@ -378,7 +403,7 @@ impl Codex {
     /// This is a convenience for approval flows whose successful response
     /// payload is `{}`.
     pub async fn approve_server_request(&self, request_id: RequestId) -> Result<()> {
-        self.resolve_server_request(request_id, serde_json::json!({}))
+        self.resolve_server_request_value(request_id, serde_json::json!({}))
             .await
     }
 
@@ -1259,6 +1284,25 @@ impl IntoFuture for CodexRemoteBuilder {
 mod tests {
     use super::*;
     use crate::thread_defaults::merge_thread_config_overrides;
+
+    #[test]
+    fn thread_handle_response_only_requires_thread_id() {
+        let response =
+            serde_json::from_value::<ThreadHandleResponse>(serde_json::json!({
+                "thread": {
+                    "id": "existing-thread",
+                    "turns": [{"items": [{"type": "newItemType"}]}],
+                },
+            }))
+            .expect("history is unused by the thread handle");
+        assert_eq!(response.thread.id, "existing-thread");
+        assert!(
+            serde_json::from_value::<ThreadHandleResponse>(serde_json::json!({
+                "thread": {},
+            }))
+            .is_err()
+        );
+    }
 
     fn test_config_build_options(
         codex_home: &std::path::Path,

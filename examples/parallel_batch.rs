@@ -55,6 +55,7 @@ fn main() -> anyhow::Result<()> {
                     &mut events,
                     turn.turn_id(),
                     ServerRequestPolicy::Reject,
+                    false,
                 )
                 .await?;
                 anyhow::Ok((name, thread.id().to_owned(), response))

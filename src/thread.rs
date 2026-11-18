@@ -256,10 +256,12 @@ pub struct ThreadBuilder {
 
 impl ThreadBuilder {
     pub(crate) fn new(codex: Codex) -> Self {
-        Self {
-            params: codex.default_thread_params().clone(),
-            codex,
-        }
+        let params = codex.default_thread_params().clone();
+        Self::from_params(codex, params)
+    }
+
+    pub(crate) fn from_params(codex: Codex, params: ThreadStartParams) -> Self {
+        Self { codex, params }
     }
 
     /// Replace the native Codex `thread/start` params for this builder.

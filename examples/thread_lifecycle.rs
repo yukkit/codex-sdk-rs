@@ -99,7 +99,13 @@ async fn resume_and_continue(codex: &Codex, thread_id: String) -> anyhow::Result
 }
 
 async fn inspect(codex: &Codex, thread_id: String) -> anyhow::Result<()> {
-    let thread = codex.resume_thread(&thread_id).await?;
+    let thread = codex
+        .resume_thread_params(ThreadResumeParams {
+            thread_id,
+            exclude_turns: true,
+            ..Default::default()
+        })
+        .await?;
     let snapshot = thread.read(true).await?;
     println!("thread: {}", snapshot.thread.id);
     println!("name: {:?}", snapshot.thread.name);

@@ -9,7 +9,7 @@ use codex_protocol::openai_models::ReasoningEffort;
 use crate::client::Codex;
 use crate::error::{Error, Result};
 use crate::runtime::RuntimeHandle;
-use crate::thread::Thread;
+use crate::thread::{Thread, ThreadBuilder};
 use crate::thread_defaults::EnvironmentAccess;
 use crate::types::{TurnId, cwd_to_string};
 
@@ -231,10 +231,7 @@ impl CodexTurnBuilder {
     /// [`Error::TemporaryTurnStart`] retains
     /// the created [`Thread`] so its event stream and state remain recoverable.
     pub async fn start(self) -> Result<TurnHandle> {
-        let thread = self
-            .codex
-            .thread()
-            .params(self.thread_params)
+        let thread = ThreadBuilder::from_params(self.codex, self.thread_params)
             .start()
             .await?;
         let thread_id = thread.id().to_string();

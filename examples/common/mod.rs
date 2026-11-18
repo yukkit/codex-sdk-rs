@@ -27,7 +27,7 @@ impl ServerRequestPolicy {
     }
 }
 
-/// Consume one turn from a thread's long-lived event stream.
+/// Print one turn from a thread's long-lived event stream.
 ///
 /// Callers keep the same stream for later turns. This helper never obtains a
 /// second stream and never treats `TurnCompleted` as the end of the thread.
@@ -35,11 +35,11 @@ pub async fn consume_turn(
     stream: &mut ThreadEventStream,
     turn_id: &str,
     request_policy: ServerRequestPolicy,
-) -> anyhow::Result<String> {
-    consume_turn_inner(stream, turn_id, request_policy, true).await
+) -> anyhow::Result<()> {
+    consume_turn_inner(stream, turn_id, request_policy, true, None).await
 }
 
-/// Collect one turn without printing interleaved deltas.
+/// Collect one turn, optionally printing each delta as it arrives.
 ///
 /// This is useful for concurrent batch examples; completion and request
 /// handling semantics are identical to [`consume_turn`].
@@ -47,8 +47,18 @@ pub async fn collect_turn(
     stream: &mut ThreadEventStream,
     turn_id: &str,
     request_policy: ServerRequestPolicy,
+    print_deltas: bool,
 ) -> anyhow::Result<String> {
-    consume_turn_inner(stream, turn_id, request_policy, false).await
+    let mut response = String::new();
+    consume_turn_inner(
+        stream,
+        turn_id,
+        request_policy,
+        print_deltas,
+        Some(&mut response),
+    )
+    .await?;
+    Ok(response)
 }
 
 /// Wait until the server reports that a turn is active before steering or
@@ -102,9 +112,8 @@ async fn consume_turn_inner(
     turn_id: &str,
     request_policy: ServerRequestPolicy,
     print_deltas: bool,
-) -> anyhow::Result<String> {
-    let mut response = String::new();
-
+    mut response: Option<&mut String>,
+) -> anyhow::Result<()> {
     while let Some(event) = stream.next().await {
         match event {
             AppServerEvent::ServerNotification(notification) => match *notification {
@@ -114,7 +123,9 @@ async fn consume_turn_inner(
                     if print_deltas {
                         print!("{}", delta.delta);
                     }
-                    response.push_str(&delta.delta);
+                    if let Some(response) = response.as_deref_mut() {
+                        response.push_str(&delta.delta);
+                    }
                 }
                 ServerNotification::TurnCompleted(done) if done.turn.id == turn_id => {
                     if print_deltas {
@@ -127,7 +138,7 @@ async fn consume_turn_inner(
                     if done.turn.status
                         == codex_app_server_protocol::TurnStatus::Completed
                     {
-                        return Ok(response);
+                        return Ok(());
                     }
                     let error = done
                         .turn

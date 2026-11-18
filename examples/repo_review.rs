@@ -5,7 +5,7 @@ mod common;
 use std::path::PathBuf;
 
 use codex_sdk::prelude::*;
-use common::{ServerRequestPolicy, consume_turn};
+use common::{ServerRequestPolicy, collect_turn};
 use serde::Deserialize;
 
 #[derive(Debug, Deserialize)]
@@ -94,9 +94,13 @@ fn main() -> anyhow::Result<()> {
             turn.turn_id()
         );
         let mut events = turn.thread().event_stream()?;
-        let response =
-            consume_turn(&mut events, turn.turn_id(), ServerRequestPolicy::Reject)
-                .await?;
+        let response = collect_turn(
+            &mut events,
+            turn.turn_id(),
+            ServerRequestPolicy::Reject,
+            true,
+        )
+        .await?;
         let report: ReviewReport = serde_json::from_str(&response)?;
 
         println!("summary: {}", report.summary);
